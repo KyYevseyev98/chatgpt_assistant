@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import MAX_HISTORY_MESSAGES
-from db import check_limit
+from db import check_limit, log_event
 from localization import (
     get_lang,
     text_limit_reached,
@@ -38,6 +38,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text_limit_reached(lang),
             reply_markup=_pro_keyboard(lang),
         )
+        try:
+            log_event(user_id, "voice_limit_reached")
+        except Exception as e:
+            logger.warning("Не удалось залогировать voice_limit_reached: %s", e)
         return
 
     # фоновый typing на всё время обработки
@@ -89,6 +93,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history = history[-MAX_HISTORY_MESSAGES:]
 
         context.chat_data["history"] = history
+
+        # логируем голосовое событие
+        try:
+            log_event(
+                user_id,
+                "voice",
+                tokens=len(transcribed_text) if transcribed_text else None,
+            )
+        except Exception as e:
+            logger.warning("Не удалось залогировать voice-событие: %s", e)
+
     finally:
         stop_event.set()
         with suppress(Exception):

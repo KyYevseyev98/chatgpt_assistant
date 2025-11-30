@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
 from config import MAX_HISTORY_MESSAGES
-from db import check_limit
+from db import check_limit, log_event
 from localization import (
     get_lang,
     start_text,
@@ -33,6 +33,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(start_text(lang))
 
+    # можно логнуть, что юзер сделал /start (по желанию)
+    try:
+        log_event(user.id, "start")
+    except Exception as e:
+        logger.warning("Не удалось залогировать событие start: %s", e)
+
 
 async def reset_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -41,6 +47,12 @@ async def reset_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["history"] = []
 
     await update.message.reply_text(reset_text(lang))
+
+    # логируем сброс диалога
+    try:
+        log_event(user.id, "reset")
+    except Exception as e:
+        logger.warning("Не удалось залогировать событие reset: %s", e)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,6 +71,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # защищённые темы
     if is_forbidden_topic(text):
         await msg.reply_text(forbidden_reply(lang))
+        try:
+            log_event(user_id, "forbidden_text")
+        except Exception as e:
+            logger.warning("Не удалось залогировать forbidden_text: %s", e)
         return
 
     # лимит текстов
@@ -67,6 +83,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text_limit_reached(lang),
             reply_markup=_pro_keyboard(lang),
         )
+        try:
+            log_event(user_id, "text_limit_reached")
+        except Exception as e:
+            logger.warning("Не удалось залогировать text_limit_reached: %s", e)
         return
 
     history: List[Dict[str, str]] = context.chat_data.get("history", [])
@@ -99,5 +119,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history = history[-MAX_HISTORY_MESSAGES:]
 
     context.chat_data["history"] = history
+
+    # логируем успешный текстовый запрос
+    try:
+        # можно в tokens временно писать длину текста
+        log_event(user_id, "text", tokens=len(text))
+    except Exception as e:
+        logger.warning("Не удалось залогировать text-событие: %s", e)
 
     await send_smart_answer(msg, answer)

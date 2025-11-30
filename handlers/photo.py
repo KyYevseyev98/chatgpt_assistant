@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import MAX_HISTORY_MESSAGES
-from db import check_limit
+from db import check_limit, log_event
 from localization import (
     get_lang,
     photo_limit_reached,
@@ -45,6 +45,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["handled_media_groups"] = handled_groups
 
         await msg.reply_text(multi_photo_not_allowed(lang))
+        try:
+            log_event(user_id, "multi_photo_not_allowed")
+        except Exception as e:
+            logger.warning("Не удалось залогировать multi_photo_not_allowed: %s", e)
         return
 
     # =====================================================
@@ -55,6 +59,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo_limit_reached(lang),
             reply_markup=_pro_keyboard(lang),
         )
+        try:
+            log_event(user_id, "photo_limit_reached")
+        except Exception as e:
+            logger.warning("Не удалось залогировать photo_limit_reached: %s", e)
         return
 
     # фоновый typing
@@ -73,6 +81,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.exception("Ошибка при скачивании фото: %s", e)
             await msg.reply_text(photo_placeholder_text(lang))
+            try:
+                log_event(user_id, "photo_download_error", meta=str(e))
+            except Exception as e2:
+                logger.warning("Не удалось залогировать photo_download_error: %s", e2)
             return
 
         # вопрос пользователя к фото:
@@ -99,6 +111,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.exception("Ошибка при запросе к OpenAI (image): %s", e)
             answer = photo_placeholder_text(lang)
+            try:
+                log_event(user_id, "photo_gpt_error", meta=str(e))
+            except Exception as e2:
+                logger.warning("Не удалось залогировать photo_gpt_error: %s", e2)
 
         # добавляем в историю текст вопроса и ответ (чтобы контекст с картинкой учитывался)
         history.append({"role": "user", "content": user_question})
@@ -108,6 +124,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history = history[-MAX_HISTORY_MESSAGES:]
 
         context.chat_data["history"] = history
+
+        # логируем успешный фото-запрос
+        try:
+            log_event(user_id, "photo")
+        except Exception as e:
+            logger.warning("Не удалось залогировать photo-событие: %s", e)
+
     finally:
         stop_event.set()
         with suppress(Exception):

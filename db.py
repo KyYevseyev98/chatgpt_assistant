@@ -17,9 +17,10 @@ cur = conn.cursor()
 
 def init_db() -> None:
     """
-    Создаёт таблицу users, если её нет, и выполняет простые миграции.
+    Создаёт таблицы users и events, если их нет, и выполняет простые миграции.
     Вызывается один раз при старте бота.
     """
+    # --- таблица пользователей ---
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -34,7 +35,7 @@ def init_db() -> None:
     )
     conn.commit()
 
-    # миграции на случай старой схемы
+    # миграции по users
     cur.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in cur.fetchall()]
 
@@ -46,6 +47,39 @@ def init_db() -> None:
 
     if "pro_until" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN pro_until TEXT")
+        conn.commit()
+
+    # --- таблица событий (логи запросов / оплат) ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,          -- 'text', 'voice', 'photo', 'payment', ...
+            tokens INTEGER,                    -- зарезервировано под токены / длину
+            is_pro INTEGER DEFAULT 0,          -- был ли PRO на момент события
+            meta TEXT,                         -- доп. информация (JSON / payload / что угодно)
+            created_at TEXT NOT NULL           -- UTC ISO-строка
+        )
+        """
+    )
+    conn.commit()
+
+    # минимальные миграции для events (на будущее, если схема изменится)
+    cur.execute("PRAGMA table_info(events)")
+    event_cols = [row[1] for row in cur.fetchall()]
+
+    if "tokens" not in event_cols:
+        cur.execute("ALTER TABLE events ADD COLUMN tokens INTEGER")
+        conn.commit()
+    if "is_pro" not in event_cols:
+        cur.execute("ALTER TABLE events ADD COLUMN is_pro INTEGER DEFAULT 0")
+        conn.commit()
+    if "meta" not in event_cols:
+        cur.execute("ALTER TABLE events ADD COLUMN meta TEXT")
+        conn.commit()
+    if "created_at" not in event_cols:
+        cur.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
         conn.commit()
 
 
@@ -191,3 +225,39 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
         else:
             update_user(user_id, used_text, last_date, is_pro, used_photos, pro_until)
             return False
+
+
+def log_event(
+    user_id: int,
+    event_type: str,
+    *,
+    tokens: Optional[int] = None,
+    meta: Optional[str] = None,
+) -> None:
+    """
+    Пишет запись в лог событий.
+
+    event_type:
+        - "text"
+        - "voice"
+        - "photo"
+        - "payment"
+        - в будущем: "start", "limit_reached" и т.п.
+
+    tokens  — пока можно не трогать (зарезервировано под токены / длину сообщения)
+    meta    — любая строка (например, JSON, payload тарифа и т.д.)
+    """
+    # берём актуальную инфу о пользователе, чтобы понять, активен ли PRO
+    _, _, _, is_pro_flag, _, pro_until = get_user(user_id)
+    is_pro_active = 1 if _pro_active(pro_until) else 0
+
+    created_at = dt.datetime.utcnow().isoformat()
+
+    cur.execute(
+        """
+        INSERT INTO events (user_id, event_type, tokens, is_pro, meta, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, event_type, tokens, is_pro_active, meta, created_at),
+    )
+    conn.commit()

@@ -13,7 +13,7 @@ from config import (
     PRO_MONTH_STARS,
     PRO_QUARTER_STARS,
 )
-from db import set_pro
+from db import set_pro, log_event
 from localization import (
     get_lang,
     pro_offer_text,
@@ -119,7 +119,7 @@ async def successful_payment_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     """
-    Когда оплата прошла — включаем PRO.
+    Когда оплата прошла — включаем PRO и логируем оплату.
     """
     user = update.effective_user
     lang = get_lang(user)
@@ -136,5 +136,12 @@ async def successful_payment_callback(
         days = 30
 
     set_pro(user.id, days)
+
+    # логируем успешную оплату
+    try:
+        # в meta сохраняем тип тарифа
+        log_event(user.id, "payment", meta=payload)
+    except Exception as e:
+        logger.warning("Не удалось залогировать payment-событие: %s", e)
 
     await update.message.reply_text(pro_success_text(lang, days))
