@@ -6,7 +6,36 @@ from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
 from config import MAX_HISTORY_MESSAGES
-from db import check_limit, log_event
+from db import check_limit, log_event, set_traffic_source
+from localization import (
+    get_lang,
+    start_text,
+    reset_text,
+    forbidden_reply,
+    text_limit_reached,
+)
+from gpt_client import (
+    is_forbidden_topic,
+    ask_gpt,
+)
+
+from .common import send_smart_answer
+from .pro import _pro_keyboard
+
+logger = logging.getLogger(__name__)
+
+
+# handlers/text.py
+
+import logging
+from typing import List, Dict
+
+from telegram import Update
+from telegram.ext import ContextTypes
+from telegram.constants import ChatAction
+
+from config import MAX_HISTORY_MESSAGES
+from db import check_limit, log_event, set_traffic_source   # <= ВАЖНО здесь log_event и set_traffic_source
 from localization import (
     get_lang,
     start_text,
@@ -31,13 +60,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.chat_data["history"] = []
 
-    await update.message.reply_text(start_text(lang))
+    # --- читаем source из /start <source> ---
+    args = context.args
+    if args:
+        source = args[0]      # например "ads_tt"
+    else:
+        source = "organic"
 
-    # можно логнуть, что юзер сделал /start (по желанию)
+    # --- сохраняем источник трафика (один раз) ---
     try:
-        log_event(user.id, "start")
+        set_traffic_source(user.id, source)
+    except Exception as e:
+        logger.warning("Не удалось сохранить traffic_source: %s", e)
+
+    # --- логируем событие /start ---
+    try:
+        log_event(user.id, f"start:{source}")
     except Exception as e:
         logger.warning("Не удалось залогировать событие start: %s", e)
+
+    await update.message.reply_text(start_text(lang))
 
 
 async def reset_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):

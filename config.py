@@ -32,3 +32,14 @@ def format_stars(stars: int) -> str:
 
 def today_iso() -> str:
     return dt.date.today().isoformat()
+
+# --- настройки админ-бота ---
+
+# токен админ-бота (заполняется через .env)
+ADMIN_TG_TOKEN = os.getenv("ADMIN_TG_TOKEN")
+
+# список ID админов, через .env вида: ADMIN_IDS="12345,67890"
+_admin_ids_raw = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [
+    int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()
+]

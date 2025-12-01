@@ -17,7 +17,8 @@ cur = conn.cursor()
 
 def init_db() -> None:
     """
-    Создаёт таблицы users и events, если их нет, и выполняет простые миграции.
+    Создаёт таблицы users, events и pro_payments, если их нет,
+    и выполняет простые миграции.
     Вызывается один раз при старте бота.
     """
     # --- таблица пользователей ---
@@ -29,13 +30,14 @@ def init_db() -> None:
             last_reset_date TEXT,
             is_pro INTEGER DEFAULT 0,
             free_photos_used_today INTEGER DEFAULT 0,
-            pro_until TEXT
+            pro_until TEXT,
+            traffic_source TEXT
         )
         """
     )
     conn.commit()
 
-    # миграции по users
+    # миграции по users (на случай старой схемы)
     cur.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in cur.fetchall()]
 
@@ -49,7 +51,11 @@ def init_db() -> None:
         cur.execute("ALTER TABLE users ADD COLUMN pro_until TEXT")
         conn.commit()
 
-    # --- таблица событий (логи запросов / оплат) ---
+    if "traffic_source" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN traffic_source TEXT")
+        conn.commit()
+
+    # --- таблица событий (логи запросов / оплат / и т.п.) ---
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -65,7 +71,7 @@ def init_db() -> None:
     )
     conn.commit()
 
-    # минимальные миграции для events (на будущее, если схема изменится)
+    # минимальные миграции для events (если что-то меняли)
     cur.execute("PRAGMA table_info(events)")
     event_cols = [row[1] for row in cur.fetchall()]
 
@@ -82,6 +88,38 @@ def init_db() -> None:
         cur.execute("ALTER TABLE events ADD COLUMN created_at TEXT")
         conn.commit()
 
+    # --- таблица оплат PRO ---
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pro_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            stars INTEGER NOT NULL,
+            days INTEGER NOT NULL,
+            traffic_source TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+def set_traffic_source(user_id: int, source: str) -> None:
+    """
+    Сохраняем источник трафика для юзера.
+    Если уже есть источник – не перезаписываем (чтобы /start из других мест не ломали аналитику).
+    """
+    # убеждаемся, что пользователь существует
+    get_user(user_id)
+
+    cur.execute(
+        """
+        UPDATE users
+        SET traffic_source = COALESCE(traffic_source, ?)
+        WHERE user_id = ?
+        """,
+        (source, user_id),
+    )
+    conn.commit()
 
 def get_user(user_id: int) -> Tuple[int, int, str, int, int, Optional[str]]:
     """
@@ -259,5 +297,33 @@ def log_event(
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (user_id, event_type, tokens, is_pro_active, meta, created_at),
+    )
+    conn.commit()
+
+    
+def log_pro_payment(user_id: int, stars: int, days: int) -> None:
+    """
+    Логируем факт покупки PRO в таблицу pro_payments.
+    - user_id   — кто купил
+    - stars     — сколько звёзд списалось
+    - days      — на сколько дней дали PRO
+    - traffic_source — берём из таблицы users на момент оплаты
+    """
+    # пробуем прочитать источник трафика из users
+    cur.execute(
+        "SELECT traffic_source FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    traffic_source = row[0] if row and row[0] is not None else None
+
+    created_at = dt.datetime.utcnow().isoformat()
+
+    cur.execute(
+        """
+        INSERT INTO pro_payments (user_id, stars, days, traffic_source, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (user_id, stars, days, traffic_source, created_at),
     )
     conn.commit()

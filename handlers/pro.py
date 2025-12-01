@@ -13,7 +13,7 @@ from config import (
     PRO_MONTH_STARS,
     PRO_QUARTER_STARS,
 )
-from db import set_pro, log_event
+from db import set_pro, log_pro_payment, log_event
 from localization import (
     get_lang,
     pro_offer_text,
@@ -115,11 +115,40 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer(ok=True)
 
 
+# handlers/pro.py
+
+import logging
+
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Update,
+)
+from telegram.ext import ContextTypes
+
+from config import (
+    PRO_WEEK_STARS,
+    PRO_MONTH_STARS,
+    PRO_QUARTER_STARS,
+)
+from db import set_pro, log_pro_payment   # <= тут ДОБАВИЛИ log_pro_payment
+from localization import (
+    get_lang,
+    pro_offer_text,
+    pro_success_text,
+)
+
+logger = logging.getLogger(__name__)
+
+# ... остальной код файла не трогаем ...
+
+
 async def successful_payment_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     """
-    Когда оплата прошла — включаем PRO и логируем оплату.
+    Когда оплата прошла — включаем PRO + логируем платеж.
     """
     user = update.effective_user
     lang = get_lang(user)
@@ -128,20 +157,25 @@ async def successful_payment_callback(
 
     if payload == "pro_week":
         days = 7
+        stars = PRO_WEEK_STARS
     elif payload == "pro_month":
         days = 30
+        stars = PRO_MONTH_STARS
     elif payload == "pro_quarter":
         days = 90
+        stars = PRO_QUARTER_STARS
     else:
+        # на всякий случай дефолт
         days = 30
+        stars = PRO_MONTH_STARS
 
+    # включаем PRO
     set_pro(user.id, days)
 
-    # логируем успешную оплату
+    # логируем оплату в pro_payments
     try:
-        # в meta сохраняем тип тарифа
-        log_event(user.id, "payment", meta=payload)
+        log_pro_payment(user.id, stars=stars, days=days)
     except Exception as e:
-        logger.warning("Не удалось залогировать payment-событие: %s", e)
+        logger.warning("Не удалось залогировать оплату PRO: %s", e)
 
     await update.message.reply_text(pro_success_text(lang, days))
