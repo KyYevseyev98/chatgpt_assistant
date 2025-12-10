@@ -1,3 +1,4 @@
+# handlers/common.py
 import logging
 import asyncio
 from html import escape
@@ -11,12 +12,12 @@ def split_answer_into_blocks(answer: str):
     """
     Делит ответ на блоки:
     - обычный текст
-    - блоки кода между ``` ``` (с возможным указанием языка).
+    - блоки кода между ``` ```
 
-    Возвращает список словарей вида:
-    { "type": "text", "content": "..." }
+    Возвращает список словарей:
+    {"type": "text", "content": "..."}
     или
-    { "type": "code", "content": "...", "lang": "python" }
+    {"type": "code", "content": "...", "lang": "python"}
     """
     blocks = []
     if not answer:
@@ -36,20 +37,24 @@ def split_answer_into_blocks(answer: str):
             if not in_code:
                 # открытие блока кода
                 if buf:
-                    blocks.append({
-                        "type": "text",
-                        "content": "".join(buf),
-                    })
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "content": "".join(buf),
+                        }
+                    )
                     buf = []
                 in_code = True
                 code_lang = fence_lang
             else:
                 # закрытие блока кода
-                blocks.append({
-                    "type": "code",
-                    "content": "".join(buf),
-                    "lang": code_lang,
-                })
+                blocks.append(
+                    {
+                        "type": "code",
+                        "content": "".join(buf),
+                        "lang": code_lang,
+                    }
+                )
                 buf = []
                 in_code = False
                 code_lang = None
@@ -58,29 +63,36 @@ def split_answer_into_blocks(answer: str):
 
     # остаток
     if buf:
-        blocks.append({
-            "type": "code" if in_code else "text",
-            "content": "".join(buf),
-            "lang": code_lang if in_code else None,
-        })
+        blocks.append(
+            {
+                "type": "code" if in_code else "text",
+                "content": "".join(buf),
+                "lang": code_lang if in_code else None,
+            }
+        )
 
     return blocks
 
 
-async def send_smart_answer(msg, answer: str):
+async def send_smart_answer(message, answer: str, reply_markup=None):
     """
-    "Умная" отправка ответа БЕЗ стриминга:
+    "Умная" отправка ответа:
     - делим текст на блоки (обычный текст + ```код```),
-    - все текстовые блоки отправляем как обычные сообщения,
-    - кодовые блоки отправляем отдельными сообщениями в формате <pre><code> с HTML.
+    - текстовые блоки отправляем как обычные сообщения,
+    - кодовые блоки — отдельными сообщениями <pre><code>…</code></pre>.
+
+    reply_markup (клавиатура) вешаем только к ПЕРВОМУ текстовому сообщению,
+    чтобы кнопки не дублировались.
     """
     answer = answer or ""
     blocks = split_answer_into_blocks(answer)
 
-    # если разметки нет — просто одно сообщение целиком
+    # если разметки нет — одно сообщение целиком
     if not blocks:
-        await msg.reply_text(answer)
+        await message.reply_text(answer, reply_markup=reply_markup)
         return
+
+    first_text_sent = False
 
     for block in blocks:
         btype = block.get("type")
@@ -93,13 +105,17 @@ async def send_smart_answer(msg, answer: str):
             code_text = escape(content)
             html_code = f"<pre><code>{code_text}</code></pre>"
             try:
-                await msg.reply_text(html_code, parse_mode="HTML")
+                await message.reply_text(html_code, parse_mode="HTML")
             except Exception as e:
                 logger.warning("Не удалось отправить код блоком, шлём plain: %s", e)
-                await msg.reply_text(content)
+                await message.reply_text(content)
         else:
-            # обычный текстовый блок — просто как есть
-            await msg.reply_text(content)
+            # обычный текстовый блок
+            if not first_text_sent:
+                await message.reply_text(content, reply_markup=reply_markup)
+                first_text_sent = True
+            else:
+                await message.reply_text(content)
 
 
 async def send_typing_action(bot, chat_id: int, stop_event: asyncio.Event):

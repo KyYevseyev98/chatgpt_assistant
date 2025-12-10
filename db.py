@@ -1,4 +1,3 @@
-# db.py
 import sqlite3
 import datetime as dt
 from typing import Tuple, Optional
@@ -9,6 +8,20 @@ from config import (
     FREE_PHOTO_LIMIT_PER_DAY,
     today_iso,
 )
+
+# --- формула дней игнора для follow-up ---
+def required_ignored_days_for_stage(stage: int) -> int:
+    """
+    Сколько дней игнора нужно, чтобы отправить follow-up для данного stage.
+
+    stage: 0 -> первый follow-up, 1 -> второй и т.д.
+
+    Формула: дни игнора растут всё медленнее (интервал между рассылками растёт на +3 дня).
+    """
+    n = stage + 1
+    # D(n) = 2 + 3 * (n-1)*n/2  (то, что мы с тобой обсуждали)
+    return 2 + (3 * (n - 1) * n) // 2
+
 
 # --- глобальное соединение с БД ---
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -31,7 +44,10 @@ def init_db() -> None:
             is_pro INTEGER DEFAULT 0,
             free_photos_used_today INTEGER DEFAULT 0,
             pro_until TEXT,
-            traffic_source TEXT
+            traffic_source TEXT,
+            last_activity_at TEXT,           -- когда юзер последний раз что-то делал
+            last_followup_at TEXT,           -- когда последний раз отправляли follow-up
+            followup_stage INTEGER DEFAULT 0 -- какой по счёту follow-up уже был
         )
         """
     )
@@ -53,6 +69,21 @@ def init_db() -> None:
 
     if "traffic_source" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN traffic_source TEXT")
+        conn.commit()
+
+    # 👉 новые поля для рассылок
+    if "last_activity_at" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_activity_at TEXT")
+        conn.commit()
+
+    if "last_followup_at" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN last_followup_at TEXT")
+        conn.commit()
+
+    if "followup_stage" not in cols:
+        cur.execute(
+            "ALTER TABLE users ADD COLUMN followup_stage INTEGER DEFAULT 0"
+        )
         conn.commit()
 
     # --- таблица событий (логи запросов / оплат / и т.п.) ---
@@ -103,6 +134,7 @@ def init_db() -> None:
     )
     conn.commit()
 
+
 def set_traffic_source(user_id: int, source: str) -> None:
     """
     Сохраняем источник трафика для юзера.
@@ -121,10 +153,33 @@ def set_traffic_source(user_id: int, source: str) -> None:
     )
     conn.commit()
 
-def get_user(user_id: int) -> Tuple[int, int, str, int, int, Optional[str]]:
+
+def get_user(
+    user_id: int,
+) -> Tuple[
+    int,
+    int,
+    str,
+    int,
+    int,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    int,
+]:
     """
     Возвращает:
-    (user_id, used_text, last_date, is_pro_flag, used_photos, pro_until_iso)
+    (
+        user_id,
+        used_text,
+        last_date,
+        is_pro_flag,
+        used_photos,
+        pro_until_iso,
+        last_activity_at_iso,
+        last_followup_at_iso,
+        followup_stage
+    )
     и создаёт пользователя, если его нет.
     """
     cur.execute(
@@ -134,7 +189,10 @@ def get_user(user_id: int) -> Tuple[int, int, str, int, int, Optional[str]]:
                last_reset_date,
                is_pro,
                free_photos_used_today,
-               pro_until
+               pro_until,
+               last_activity_at,
+               last_followup_at,
+               followup_stage
         FROM users
         WHERE user_id = ?
         """,
@@ -151,14 +209,19 @@ def get_user(user_id: int) -> Tuple[int, int, str, int, int, Optional[str]]:
                 last_reset_date,
                 is_pro,
                 free_photos_used_today,
-                pro_until
+                pro_until,
+                traffic_source,
+                last_activity_at,
+                last_followup_at,
+                followup_stage
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, 0, today, 0, 0, None),
+            # traffic_source, last_activity_at, last_followup_at, followup_stage
+            (user_id, 0, today, 0, 0, None, None, None, None, 0),
         )
         conn.commit()
-        return (user_id, 0, today, 0, 0, None)
+        return (user_id, 0, today, 0, 0, None, None, None, 0)
     return row
 
 
@@ -169,6 +232,9 @@ def update_user(
     is_pro: int,
     used_photos: int,
     pro_until: Optional[str],
+    last_activity_at: Optional[str],
+    last_followup_at: Optional[str],
+    followup_stage: int,
 ) -> None:
     cur.execute(
         """
@@ -177,10 +243,23 @@ def update_user(
             last_reset_date = ?,
             is_pro = ?,
             free_photos_used_today = ?,
-            pro_until = ?
+            pro_until = ?,
+            last_activity_at = ?,
+            last_followup_at = ?,
+            followup_stage = ?
         WHERE user_id = ?
         """,
-        (used_text, last_date, is_pro, used_photos, pro_until, user_id),
+        (
+            used_text,
+            last_date,
+            is_pro,
+            used_photos,
+            pro_until,
+            last_activity_at,
+            last_followup_at,
+            followup_stage,
+            user_id,
+        ),
     )
     conn.commit()
 
@@ -200,7 +279,17 @@ def set_pro(user_id: int, days: int) -> None:
     Продлевает / выдаёт PRO на N дней.
     Если уже есть активная PRO – добавляем дни к текущей дате окончания.
     """
-    user_id, used_text, last_date, is_pro, used_photos, pro_until = get_user(user_id)
+    (
+        _uid,
+        used_text,
+        last_date,
+        _is_pro,
+        used_photos,
+        pro_until,
+        last_activity_at,
+        last_followup_at,
+        followup_stage,
+    ) = get_user(user_id)
 
     now = dt.datetime.utcnow()
     if _pro_active(pro_until):
@@ -215,7 +304,17 @@ def set_pro(user_id: int, days: int) -> None:
     new_until = new_until_dt.isoformat()
 
     # включаем флаг is_pro = 1
-    update_user(user_id, used_text, last_date, 1, used_photos, new_until)
+    update_user(
+        user_id,
+        used_text,
+        last_date,
+        1,
+        used_photos,
+        new_until,
+        last_activity_at,
+        last_followup_at,
+        followup_stage,
+    )
 
 
 def check_limit(user_id: int, is_photo: bool = False) -> bool:
@@ -224,21 +323,51 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
     False – лимит превышен
     Учитывает PRO-подписку (если активна — лимитов нет).
     """
-    user_id, used_text, last_date, is_pro, used_photos, pro_until = get_user(user_id)
+    (
+        _uid,
+        used_text,
+        last_date,
+        is_pro,
+        used_photos,
+        pro_until,
+        last_activity_at,
+        last_followup_at,
+        followup_stage,
+    ) = get_user(user_id)
     today = today_iso()
 
     # если PRO активна — сразу пропускаем без лимитов
     if _pro_active(pro_until):
         if not is_pro:
             # на всякий случай синхронизируем флаг
-            update_user(user_id, used_text, last_date, 1, used_photos, pro_until)
+            update_user(
+                user_id,
+                used_text,
+                last_date,
+                1,
+                used_photos,
+                pro_until,
+                last_activity_at,
+                last_followup_at,
+                followup_stage,
+            )
         return True
     else:
         # если истекла — сбрасываем флаг и pro_until
         if is_pro or pro_until is not None:
             pro_until = None
             is_pro = 0
-            update_user(user_id, used_text, last_date, is_pro, used_photos, pro_until)
+            update_user(
+                user_id,
+                used_text,
+                last_date,
+                is_pro,
+                used_photos,
+                pro_until,
+                last_activity_at,
+                last_followup_at,
+                followup_stage,
+            )
 
     # новый день – обнуляем счётчики
     if last_date != today:
@@ -250,20 +379,154 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
     if is_photo:
         if used_photos < FREE_PHOTO_LIMIT_PER_DAY:
             used_photos += 1
-            update_user(user_id, used_text, last_date, is_pro, used_photos, pro_until)
+            update_user(
+                user_id,
+                used_text,
+                last_date,
+                is_pro,
+                used_photos,
+                pro_until,
+                last_activity_at,
+                last_followup_at,
+                followup_stage,
+            )
             return True
         else:
-            update_user(user_id, used_text, last_date, is_pro, used_photos, pro_until)
+            update_user(
+                user_id,
+                used_text,
+                last_date,
+                is_pro,
+                used_photos,
+                pro_until,
+                last_activity_at,
+                last_followup_at,
+                followup_stage,
+            )
             return False
     else:
         if used_text < FREE_TEXT_LIMIT_PER_DAY:
             used_text += 1
-            update_user(user_id, used_text, last_date, is_pro, used_photos, pro_until)
+            update_user(
+                user_id,
+                used_text,
+                last_date,
+                is_pro,
+                used_photos,
+                pro_until,
+                last_activity_at,
+                last_followup_at,
+                followup_stage,
+            )
             return True
         else:
-            update_user(user_id, used_text, last_date, is_pro, used_photos, pro_until)
+            update_user(
+                user_id,
+                used_text,
+                last_date,
+                is_pro,
+                used_photos,
+                pro_until,
+                last_activity_at,
+                last_followup_at,
+                followup_stage,
+            )
             return False
 
+
+def touch_last_activity(user_id: int) -> None:
+    """
+    Обновляем время последней активности пользователя
+    (любое его сообщение или /start) и сбрасываем стадию follow-up.
+    """
+    (
+        _uid,
+        used_text,
+        last_date,
+        is_pro,
+        used_photos,
+        pro_until,
+        _last_activity_at,
+        last_followup_at,
+        _followup_stage,
+    ) = get_user(user_id)
+
+    now_iso = dt.datetime.utcnow().isoformat()
+    update_user(
+        user_id,
+        used_text,
+        last_date,
+        is_pro,
+        used_photos,
+        pro_until,
+        now_iso,
+        last_followup_at,
+        0,  # пользователь вернулся — начинаем цепочку фоллоу-апов с нуля
+    )
+
+
+def mark_followup_sent(user_id: int) -> None:
+    """
+    Фиксируем, что отправили follow-up:
+    - увеличиваем followup_stage
+    - обновляем last_followup_at
+    """
+    (
+        _uid,
+        used_text,
+        last_date,
+        is_pro,
+        used_photos,
+        pro_until,
+        last_activity_at,
+        _last_followup_at,
+        followup_stage,
+    ) = get_user(user_id)
+
+    now_iso = dt.datetime.utcnow().isoformat()
+    update_user(
+        user_id,
+        used_text,
+        last_date,
+        is_pro,
+        used_photos,
+        pro_until,
+        last_activity_at,
+        now_iso,
+        followup_stage + 1,
+    )
+
+
+def get_followup_state(user_id: int):
+    """
+    Удобно доставать инфу для рассылок.
+    Возвращает кортеж:
+    (last_activity_at_iso, last_followup_at_iso, followup_stage)
+    """
+    row = get_user(user_id)
+    return row[6], row[7], row[8]
+
+def get_all_users_for_followup():
+    """
+    Возвращает пользователей, для которых ИМЕЕТ смысл
+    запускать периодические follow-up'ы.
+
+    ВАЖНО:
+    - новые юзеры, у которых followup_stage = 0 и last_followup_at IS NULL,
+      сюда НЕ попадают (ими занимается first_followup_job).
+    """
+    cur.execute(
+        """
+        SELECT user_id,
+               last_activity_at,
+               last_followup_at,
+               followup_stage
+        FROM users
+        WHERE last_activity_at IS NOT NULL
+          AND (last_followup_at IS NOT NULL OR followup_stage > 0)
+        """
+    )
+    return cur.fetchall()
 
 def log_event(
     user_id: int,
@@ -274,19 +537,18 @@ def log_event(
 ) -> None:
     """
     Пишет запись в лог событий.
-
-    event_type:
-        - "text"
-        - "voice"
-        - "photo"
-        - "payment"
-        - в будущем: "start", "limit_reached" и т.п.
-
-    tokens  — пока можно не трогать (зарезервировано под токены / длину сообщения)
-    meta    — любая строка (например, JSON, payload тарифа и т.д.)
     """
-    # берём актуальную инфу о пользователе, чтобы понять, активен ли PRO
-    _, _, _, is_pro_flag, _, pro_until = get_user(user_id)
+    (
+        _uid,
+        _used_text,
+        _last_date,
+        _is_pro,
+        _used_photos,
+        pro_until,
+        _last_activity_at,
+        _last_followup_at,
+        _followup_stage,
+    ) = get_user(user_id)
     is_pro_active = 1 if _pro_active(pro_until) else 0
 
     created_at = dt.datetime.utcnow().isoformat()
@@ -300,7 +562,7 @@ def log_event(
     )
     conn.commit()
 
-    
+
 def log_pro_payment(user_id: int, stars: int, days: int) -> None:
     """
     Логируем факт покупки PRO в таблицу pro_payments.
@@ -323,7 +585,8 @@ def log_pro_payment(user_id: int, stars: int, days: int) -> None:
         """
         INSERT INTO pro_payments (user_id, stars, days, traffic_source, created_at)
         VALUES (?, ?, ?, ?, ?)
-        """,
+        """
+        ,
         (user_id, stars, days, traffic_source, created_at),
     )
     conn.commit()

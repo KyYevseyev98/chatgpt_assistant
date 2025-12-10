@@ -2,12 +2,20 @@ import logging
 import asyncio
 from typing import List, Dict, Set
 from contextlib import suppress
+from .topics import get_current_topic
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import MAX_HISTORY_MESSAGES
-from db import check_limit, log_event
+from db import (
+    check_limit,
+    log_event,
+    set_traffic_source,
+    touch_last_activity,
+    get_followup_state,
+    mark_followup_sent,
+)
 from localization import (
     get_lang,
     photo_limit_reached,
@@ -30,6 +38,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     lang = get_lang(user)
+
+    # фиксируем, что юзер был активен
+    touch_last_activity(user.id)
 
     # ===== защита от альбома (несколько фото за раз) =====
     if msg.media_group_id is not None:
@@ -99,6 +110,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
 
+        topic = get_current_topic(context)
+
+        history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get(
+            "history_by_topic", {}
+        )
+        history = history_by_topic.get(topic, [])
+
         history: List[Dict[str, str]] = context.chat_data.get("history", [])
 
         try:
@@ -123,8 +141,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(history) > MAX_HISTORY_MESSAGES:
             history = history[-MAX_HISTORY_MESSAGES:]
 
-        context.chat_data["history"] = history
+        if len(history) > MAX_HISTORY_MESSAGES:
+            history = history[-MAX_HISTORY_MESSAGES:]
 
+        history_by_topic[topic] = history
+        context.chat_data["history_by_topic"] = history_by_topic
         # логируем успешный фото-запрос
         try:
             log_event(user_id, "photo")

@@ -5,9 +5,9 @@ from contextlib import suppress
 
 from telegram import Update
 from telegram.ext import ContextTypes
+from .topics import get_current_topic
 
 from config import MAX_HISTORY_MESSAGES
-from db import check_limit, log_event
 from localization import (
     get_lang,
     text_limit_reached,
@@ -15,6 +15,15 @@ from localization import (
 from gpt_client import (
     ask_gpt,
     transcribe_voice,
+)
+
+from db import (
+    check_limit,
+    log_event,
+    set_traffic_source,
+    touch_last_activity,
+    get_followup_state,
+    mark_followup_sent,
 )
 
 from .common import send_smart_answer, send_typing_action
@@ -31,6 +40,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     lang = get_lang(user)
+    
+        # фиксируем, что юзер был активен
+    touch_last_activity(user.id)
 
     # лимит считаем как текстовый запрос
     if not check_limit(user_id, is_photo=False):
@@ -69,10 +81,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 transcribed_text = "Не удалось распознать голосовое сообщение."
 
+
+
+        topic = get_current_topic(context)
+
+        history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get(
+            "history_by_topic", {}
+        )
+        history = history_by_topic.get(topic, [])
+
         # сохраняем как последний текст пользователя (для фото / контекста)
         context.chat_data["last_user_text"] = transcribed_text
 
-        history: List[Dict[str, str]] = context.chat_data.get("history", [])
+        if len(history) > MAX_HISTORY_MESSAGES:
+            history = history[-MAX_HISTORY_MESSAGES:]
+
+        history_by_topic[topic] = history
+        context.chat_data["history_by_topic"] = history_by_topic
         history.append({"role": "user", "content": transcribed_text})
 
         # 2) запрос к GPT

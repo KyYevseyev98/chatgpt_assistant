@@ -1,4 +1,6 @@
-from typing import List, Dict
+#gpt_client.py
+
+from typing import List, Dict, Optional
 import base64
 from io import BytesIO
 
@@ -49,7 +51,7 @@ def _base_system_prompt() -> str:
     Это видит только модель, пользователь этот текст не видит.
     """
     return (
-        "Ты — дружелюбный и лаконичный AI-ассистент внутри Telegram-бота ChatGPT | bot.\n"
+        "Ты — дружелюбный и лаконичный AI-ассистент внутри Telegram-бота FOXY.\n"
         "Важные правила и контекст:\n"
         "1) Ты работаешь именно в Telegram-боте, а не в браузерной версии ChatGPT.\n"
         "2) У бота есть дневные бесплатные лимиты: ограниченное количество текстовых сообщений, аудио сообщений и ограниченное количество анализов фото.\n"
@@ -77,6 +79,82 @@ async def ask_gpt(history: List[Dict[str, str]], lang: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
+async def generate_followup_text(
+    lang: str,
+    ignored_days: int,
+    stage: int,
+    last_user_message: Optional[str] = None,
+    last_bot_message: Optional[str] = None,
+    last_followup_text: Optional[str] = None,
+) -> str:
+    """
+    Генерирует короткое follow-up сообщение от Foxy с учётом контекста:
+    - сколько дней человек молчит
+    - какой по счёту follow-up
+    - опционально: последний вопрос, последний ответ, последний follow-up
+    """
+    context_block = ""
+
+    if last_user_message:
+        context_block += f"Последний вопрос пользователя: «{last_user_message[:400]}».\n"
+    if last_bot_message:
+        context_block += f"Твой последний ответ ему: «{last_bot_message[:400]}».\n"
+    if last_followup_text:
+        context_block += (
+            f"Последнее напоминание, которое ты отправлял: «{last_followup_text[:400]}».\n"
+            "Сделай новое сообщение другим по формулировкам, не повторяй его дословно.\n"
+        )
+
+    if not context_block:
+        context_block = (
+            "Контекст диалога отсутствует. Пользователь запускал бота, "
+            "но давно ничего не писал.\n"
+        )
+
+    if lang.startswith("uk"):
+        lang_block = "Пиши українською, легко й дружньо."
+    elif lang.startswith("en"):
+        lang_block = "Write in English, friendly and concise."
+    else:
+        lang_block = "Пиши по-русски, дружелюбно и по делу."
+
+    # Спец-инструкция для самого первого follow-up сразу после /start
+    first_followup_hint = ""
+    if ignored_days == 0 and stage == 0:
+        first_followup_hint = (
+            "Ситуация: користувач/пользователь тільки що запустил бота, уже увидел "
+            "приветственное сообщение (например, 'Привет! Я AI-ассистент...'), но сам "
+            "ничего не написал.\n"
+            "В ЭТОМ случае:\n"
+            "- не начинай текст со слова 'Привет' / 'Hi' / 'Hello';\n"
+            "- не представляйся заново и не повторяй, что ты AI-ассистент;\n"
+            "- сделай одно мягкое напоминание в духе: если появится вопрос — просто напиши, ты здесь и готов помочь.\n"
+        )
+
+    system_prompt = (
+        "Ты — Foxy, дружелюбный AI-ассистент в Telegram-боте.\n"
+        "Твоя задача — аккуратно напомнить пользователю о себе и пригласить продолжить диалог.\n"
+        "Не дави, не выпрашивай денег, не извиняйся по 10 раз.\n"
+        "Формат сообщения: 1–3 коротких предложения, максимум 2–4 строки.\n"
+        "Без эмодзи в начале строки, максимум 1–2 эмодзи в конце, если уместно.\n"
+        "Не используй разметку, только обычный текст.\n"
+        f"{lang_block}\n"
+        f"\nИнформация о контексте:\n{context_block}\n"
+        f"Пользователь молчит уже {ignored_days} дней. Текущий номер напоминания (от 0): {stage}.\n"
+        f"{first_followup_hint}"
+        "Сделай текст так, чтобы он ощущался живым, но не навязчивым.\n"
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Сгенерируй текст такого follow-up сообщения."},
+    ]
+
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+    )
+    return resp.choices[0].message.content.strip()
 
 async def ask_gpt_with_image(
     history: List[Dict[str, str]],

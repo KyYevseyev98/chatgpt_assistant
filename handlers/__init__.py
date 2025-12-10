@@ -7,6 +7,10 @@ from .pro import (
     precheckout_callback,
     successful_payment_callback,
 )
+from .topics import (          # <-- ДОБАВИЛИ
+    topics_command,
+    topic_button,
+)
 
 __all__ = [
     "start",
@@ -18,4 +22,6 @@ __all__ = [
     "pro_button",
     "precheckout_callback",
     "successful_payment_callback",
+    "topics_command",          # <-- ДОБАВИЛИ
+    "topic_button",            # <-- ДОБАВИЛИ
 ]
