@@ -78,7 +78,7 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
     """
     "Умная" отправка ответа:
     - делим текст на блоки (обычный текст + ```код```),
-    - текстовые блоки отправляем как обычные сообщения,
+    - текстовые блоки отправляем как HTML (поддержка <b>, <i> и т.п.),
     - кодовые блоки — отдельными сообщениями <pre><code>…</code></pre>.
 
     reply_markup (клавиатура) вешаем только к ПЕРВОМУ текстовому сообщению,
@@ -89,7 +89,12 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
 
     # если разметки нет — одно сообщение целиком
     if not blocks:
-        await message.reply_text(answer, reply_markup=reply_markup)
+        await message.reply_text(
+            answer,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     first_text_sent = False
@@ -105,17 +110,39 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
             code_text = escape(content)
             html_code = f"<pre><code>{code_text}</code></pre>"
             try:
-                await message.reply_text(html_code, parse_mode="HTML")
+                await message.reply_text(
+                    html_code,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
             except Exception as e:
                 logger.warning("Не удалось отправить код блоком, шлём plain: %s", e)
                 await message.reply_text(content)
         else:
-            # обычный текстовый блок
-            if not first_text_sent:
-                await message.reply_text(content, reply_markup=reply_markup)
-                first_text_sent = True
-            else:
-                await message.reply_text(content)
+            # обычный текстовый блок (с <b>, эмодзи и т.п.)
+            try:
+                if not first_text_sent:
+                    await message.reply_text(
+                        content,
+                        reply_markup=reply_markup,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    first_text_sent = True
+                else:
+                    await message.reply_text(
+                        content,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+            except Exception as e:
+                # если телега ругнулась на HTML (например, сломанный тег) — шлём как plain
+                logger.warning("Ошибка при отправке HTML-блока, шлём plain: %s", e)
+                if not first_text_sent:
+                    await message.reply_text(content, reply_markup=reply_markup)
+                    first_text_sent = True
+                else:
+                    await message.reply_text(content)
 
 
 async def send_typing_action(bot, chat_id: int, stop_event: asyncio.Event):

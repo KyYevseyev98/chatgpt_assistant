@@ -12,7 +12,7 @@ DB_PATH = "chatgpt_users.db"
 MODEL_NAME = "gpt-4.1-mini"
 
 # бесплатные лимиты
-FREE_TEXT_LIMIT_PER_DAY = 20
+FREE_TEXT_LIMIT_PER_DAY = 100
 FREE_PHOTO_LIMIT_PER_DAY = 1
 
 # сколько сообщений контекста помним

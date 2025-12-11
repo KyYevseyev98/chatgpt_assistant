@@ -19,7 +19,7 @@ def required_ignored_days_for_stage(stage: int) -> int:
     Формула: дни игнора растут всё медленнее (интервал между рассылками растёт на +3 дня).
     """
     n = stage + 1
-    # D(n) = 2 + 3 * (n-1)*n/2  (то, что мы с тобой обсуждали)
+    # D(n) = 2 + 3 * (n-1)*n/2
     return 2 + (3 * (n - 1) * n) // 2
 
 
@@ -30,9 +30,8 @@ cur = conn.cursor()
 
 def init_db() -> None:
     """
-    Создаёт таблицы users, events и pro_payments, если их нет,
-    и выполняет простые миграции.
-    Вызывается один раз при старте бота.
+    Создаёт таблицы users, events, pro_payments, user_profiles,
+    если их нет, и выполняет простые миграции.
     """
     # --- таблица пользователей ---
     cur.execute(
@@ -71,7 +70,6 @@ def init_db() -> None:
         cur.execute("ALTER TABLE users ADD COLUMN traffic_source TEXT")
         conn.commit()
 
-    # 👉 новые поля для рассылок
     if "last_activity_at" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN last_activity_at TEXT")
         conn.commit()
@@ -102,7 +100,7 @@ def init_db() -> None:
     )
     conn.commit()
 
-    # минимальные миграции для events (если что-то меняли)
+    # минимальные миграции для events
     cur.execute("PRAGMA table_info(events)")
     event_cols = [row[1] for row in cur.fetchall()]
 
@@ -134,22 +132,37 @@ def init_db() -> None:
     )
     conn.commit()
 
-
-def set_traffic_source(user_id: int, source: str) -> None:
-    """
-    Сохраняем источник трафика для юзера.
-    Если уже есть источник – не перезаписываем (чтобы /start из других мест не ломали аналитику).
-    """
-    # убеждаемся, что пользователь существует
-    get_user(user_id)
-
+    # --- таблица профилей пользователей (для сегментов / LTV) ---
     cur.execute(
         """
-        UPDATE users
-        SET traffic_source = COALESCE(traffic_source, ?)
-        WHERE user_id = ?
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            segments TEXT,                 -- список тегов через запятую
+            total_messages INTEGER DEFAULT 0,
+            total_photos INTEGER DEFAULT 0,
+            total_voice INTEGER DEFAULT 0,
+            pro_payments_count INTEGER DEFAULT 0,
+            last_limit_type TEXT,
+            last_lang TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _ensure_user_profile(user_id: int) -> None:
+    """
+    Гарантируем, что для user_id есть запись в user_profiles.
+    """
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO user_profiles (
+            user_id, segments, total_messages, total_photos,
+            total_voice, pro_payments_count, last_limit_type, last_lang
+        )
+        VALUES (?, '', 0, 0, 0, 0, NULL, NULL)
         """,
-        (source, user_id),
+        (user_id,),
     )
     conn.commit()
 
@@ -217,11 +230,12 @@ def get_user(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            # traffic_source, last_activity_at, last_followup_at, followup_stage
             (user_id, 0, today, 0, 0, None, None, None, None, 0),
         )
         conn.commit()
+        _ensure_user_profile(user_id)
         return (user_id, 0, today, 0, 0, None, None, None, 0)
+    _ensure_user_profile(user_id)
     return row
 
 
@@ -274,6 +288,24 @@ def _pro_active(pro_until: Optional[str]) -> bool:
     return dt_until > dt.datetime.utcnow()
 
 
+def set_traffic_source(user_id: int, source: str) -> None:
+    """
+    Сохраняем источник трафика для юзера.
+    Если уже есть источник – не перезаписываем.
+    """
+    get_user(user_id)
+
+    cur.execute(
+        """
+        UPDATE users
+        SET traffic_source = COALESCE(traffic_source, ?)
+        WHERE user_id = ?
+        """,
+        (source, user_id),
+    )
+    conn.commit()
+
+
 def set_pro(user_id: int, days: int) -> None:
     """
     Продлевает / выдаёт PRO на N дней.
@@ -303,7 +335,6 @@ def set_pro(user_id: int, days: int) -> None:
     new_until_dt = base + dt.timedelta(days=days)
     new_until = new_until_dt.isoformat()
 
-    # включаем флаг is_pro = 1
     update_user(
         user_id,
         used_text,
@@ -339,7 +370,6 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
     # если PRO активна — сразу пропускаем без лимитов
     if _pro_active(pro_until):
         if not is_pro:
-            # на всякий случай синхронизируем флаг
             update_user(
                 user_id,
                 used_text,
@@ -353,7 +383,6 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
             )
         return True
     else:
-        # если истекла — сбрасываем флаг и pro_until
         if is_pro or pro_until is not None:
             pro_until = None
             is_pro = 0
@@ -461,7 +490,7 @@ def touch_last_activity(user_id: int) -> None:
         pro_until,
         now_iso,
         last_followup_at,
-        0,  # пользователь вернулся — начинаем цепочку фоллоу-апов с нуля
+        0,
     )
 
 
@@ -506,14 +535,11 @@ def get_followup_state(user_id: int):
     row = get_user(user_id)
     return row[6], row[7], row[8]
 
+
 def get_all_users_for_followup():
     """
     Возвращает пользователей, для которых ИМЕЕТ смысл
     запускать периодические follow-up'ы.
-
-    ВАЖНО:
-    - новые юзеры, у которых followup_stage = 0 и last_followup_at IS NULL,
-      сюда НЕ попадают (ими занимается first_followup_job).
     """
     cur.execute(
         """
@@ -528,15 +554,169 @@ def get_all_users_for_followup():
     )
     return cur.fetchall()
 
+
+def update_user_profile_on_event(
+    user_id: int,
+    event_type: str,
+    *,
+    lang: Optional[str] = None,
+    segments: Optional[list[str]] = None,
+    pro_payment_increment: int = 0,
+    last_limit_type: Optional[str] = None,
+) -> None:
+    """
+    Обновляет профиль пользователя (user_profiles) при событии.
+    """
+    _ensure_user_profile(user_id)
+
+    cur.execute(
+        """
+        SELECT segments,
+               total_messages,
+               total_photos,
+               total_voice,
+               pro_payments_count,
+               last_limit_type,
+               last_lang
+        FROM user_profiles
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return
+
+    (
+        segments_str,
+        total_messages,
+        total_photos,
+        total_voice,
+        pro_payments_count,
+        last_limit_type_db,
+        last_lang_db,
+    ) = row
+
+    total_messages = total_messages or 0
+    total_photos = total_photos or 0
+    total_voice = total_voice or 0
+    pro_payments_count = pro_payments_count or 0
+
+    if event_type == "text":
+        total_messages += 1
+    elif event_type == "photo":
+        total_photos += 1
+    elif event_type == "voice":
+        total_voice += 1
+
+    if pro_payment_increment:
+        pro_payments_count += pro_payment_increment
+
+    if last_limit_type is not None:
+        last_limit_type_db = last_limit_type
+
+    if lang:
+        last_lang_db = lang
+
+    existing_segments = [s for s in (segments_str or "").split(",") if s.strip()]
+    if segments:
+        for s in segments:
+            if s and s not in existing_segments:
+                existing_segments.append(s)
+    new_segments_str = ",".join(existing_segments)
+
+    cur.execute(
+        """
+        UPDATE user_profiles
+        SET segments = ?,
+            total_messages = ?,
+            total_photos = ?,
+            total_voice = ?,
+            pro_payments_count = ?,
+            last_limit_type = ?,
+            last_lang = ?
+        WHERE user_id = ?
+        """,
+        (
+            new_segments_str,
+            total_messages,
+            total_photos,
+            total_voice,
+            pro_payments_count,
+            last_limit_type_db,
+            last_lang_db,
+            user_id,
+        ),
+    )
+    conn.commit()
+
+
+def get_user_profile_snapshot(user_id: int) -> dict:
+    """
+    Возвращает слепок профиля пользователя для GPT (для рассылок).
+    """
+    _ensure_user_profile(user_id)
+
+    cur.execute(
+        """
+        SELECT segments,
+               total_messages,
+               total_photos,
+               total_voice,
+               pro_payments_count,
+               last_limit_type,
+               last_lang
+        FROM user_profiles
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {}
+
+    (
+        segments_str,
+        total_messages,
+        total_photos,
+        total_voice,
+        pro_payments_count,
+        last_limit_type,
+        last_lang,
+    ) = row
+
+    # тянем источник трафика
+    cur.execute(
+        "SELECT traffic_source FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+    row2 = cur.fetchone()
+    traffic_source = row2[0] if row2 else None
+
+    segments_list = [s for s in (segments_str or "").split(",") if s.strip()]
+
+    return {
+        "segments": segments_list,
+        "total_messages": total_messages or 0,
+        "total_photos": total_photos or 0,
+        "total_voice": total_voice or 0,
+        "pro_payments_count": pro_payments_count or 0,
+        "last_limit_type": last_limit_type,
+        "last_lang": last_lang,
+        "traffic_source": traffic_source,
+    }
+
+
 def log_event(
     user_id: int,
     event_type: str,
     *,
     tokens: Optional[int] = None,
     meta: Optional[str] = None,
+    last_limit_type: Optional[str] = None,
 ) -> None:
     """
-    Пишет запись в лог событий.
+    Пишет запись в лог событий и, по возможности, обновляет профиль.
     """
     (
         _uid,
@@ -562,16 +742,18 @@ def log_event(
     )
     conn.commit()
 
+    # Апдейтим профиль (без языка/сегментов — они приходят отдельно)
+    update_user_profile_on_event(
+        user_id,
+        event_type,
+        last_limit_type=last_limit_type,
+    )
+
 
 def log_pro_payment(user_id: int, stars: int, days: int) -> None:
     """
-    Логируем факт покупки PRO в таблицу pro_payments.
-    - user_id   — кто купил
-    - stars     — сколько звёзд списалось
-    - days      — на сколько дней дали PRO
-    - traffic_source — берём из таблицы users на момент оплаты
+    Логируем факт покупки PRO в таблицу pro_payments и обновляем профиль.
     """
-    # пробуем прочитать источник трафика из users
     cur.execute(
         "SELECT traffic_source FROM users WHERE user_id = ?",
         (user_id,),
@@ -585,8 +767,14 @@ def log_pro_payment(user_id: int, stars: int, days: int) -> None:
         """
         INSERT INTO pro_payments (user_id, stars, days, traffic_source, created_at)
         VALUES (?, ?, ?, ?, ?)
-        """
-        ,
+        """,
         (user_id, stars, days, traffic_source, created_at),
     )
     conn.commit()
+
+    # фиксируем покупку в профиле
+    update_user_profile_on_event(
+        user_id,
+        "payment",
+        pro_payment_increment=1,
+    )

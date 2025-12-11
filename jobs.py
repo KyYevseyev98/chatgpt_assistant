@@ -3,7 +3,7 @@ from typing import Any, Dict
 
 from telegram.ext import Application, ContextTypes
 
-from db import get_user, mark_followup_sent
+from db import get_user, mark_followup_sent, get_user_profile_snapshot
 from gpt_client import generate_followup_text
 from localization import start_text
 
@@ -66,16 +66,20 @@ async def first_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if last_followup_at is not None or followup_stage > 0:
         return
 
+    # профиль для GPT
+    user_profile = get_user_profile_snapshot(user_id)
+
     # генерим текст (stage=0, ignored_days=0)
-    greeting = start_text(lang)  # то самое первое приветственное сообщение
+    greeting = start_text(lang)
 
     text = await generate_followup_text(
         lang=lang,
         ignored_days=0,
         stage=0,
         last_user_message=None,
-        last_bot_message=greeting,       # <-- передаём приветствие сюда
+        last_bot_message=greeting,
         last_followup_text=None,
+        user_profile=user_profile,
     )
 
     await context.bot.send_message(chat_id=user_id, text=text)
