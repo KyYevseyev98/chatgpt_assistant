@@ -1,14 +1,23 @@
-import datetime as dt
+# jobs.py
 from typing import Any, Dict
 
 from telegram.ext import Application, ContextTypes
 
-from db import get_user, mark_followup_sent, get_user_profile_snapshot
+from db import (
+    get_user,
+    mark_followup_sent,
+    set_last_followup_text,
+    get_followup_personalization_snapshot,
+)
 from gpt_client import generate_followup_text
 from localization import start_text
 
 
 def schedule_first_followup(app: Application, user_id: int, lang: str) -> None:
+    """
+    Ставит одноразовый follow-up через 30 сек только для совсем новых,
+    у которых ещё НЕ было follow-up и stage=0.
+    """
     (
         _uid,
         _used_text,
@@ -21,11 +30,12 @@ def schedule_first_followup(app: Application, user_id: int, lang: str) -> None:
         followup_stage,
     ) = get_user(user_id)
 
+    # если уже что-то отправляли — не надо
     if last_followup_at is not None or followup_stage > 0:
         return
 
     if app.job_queue is None:
-        return  # перестраховка
+        return
 
     app.job_queue.run_once(
         first_followup_job,
@@ -60,16 +70,17 @@ async def first_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         followup_stage,
     ) = get_user(user_id)
 
+    # если юзер уже что-то написал после /start — не шлём
     if last_activity_at != activity_snapshot:
         return
 
+    # если уже отправили что-то — не шлём
     if last_followup_at is not None or followup_stage > 0:
         return
 
-    # профиль для GPT
-    user_profile = get_user_profile_snapshot(user_id)
+    # слепок профиля/памяти (может быть пустым — ок)
+    user_profile = get_followup_personalization_snapshot(user_id)
 
-    # генерим текст (stage=0, ignored_days=0)
     greeting = start_text(lang)
 
     text = await generate_followup_text(
@@ -83,4 +94,35 @@ async def first_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     await context.bot.send_message(chat_id=user_id, text=text)
+
+    # сохраняем текст фоллоу-апа, чтобы следующий был другой
+    try:
+        set_last_followup_text(user_id, text)
+    except Exception:
+        pass
+
     mark_followup_sent(user_id)
+
+async def followup_after_limit_job(context: ContextTypes.DEFAULT_TYPE):
+    from db import get_all_users_for_followup, should_followup_after_limit
+    from gpt_client import generate_followup_text
+
+    users = get_all_users_for_followup()
+
+    for user_id, *_ in users:
+        if not should_followup_after_limit(user_id):
+            continue
+
+        try:
+            text = await generate_followup_text(
+                lang="ru",
+                ignored_days=1,
+                stage=99,  # спец-follow-up
+                last_user_message=None,
+                last_bot_message=None,
+                last_followup_text=None,
+            )
+            await context.bot.send_message(chat_id=user_id, text=text)
+            mark_followup_sent(user_id)
+        except Exception:
+            continue

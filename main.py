@@ -27,6 +27,7 @@ from handlers import (
 )
 
 import datetime as dt
+from jobs import followup_after_limit_job
 
 from db import (
     init_db,
@@ -53,7 +54,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_dialog))
     app.add_handler(CommandHandler("pro", pro_command))
-    app.add_handler(CommandHandler("topics", topics_command))  # <-- новая команда
+   #app.add_handler(CommandHandler("topics", topics_command))  # <-- новая команда
 
     # обычные сообщения и фото
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -79,6 +80,11 @@ def main():
     first=60 * 10,      # первую проверку через 10 минут после старта бота
     )
 
+    app.job_queue.run_repeating(
+    followup_after_limit_job,
+    interval=60 * 60 * 6,  # раз в 6 часов
+    first=60 * 20,
+)
     logger.info("ChatGPT Assistant запущен")
     app.run_polling()
     
@@ -132,6 +138,7 @@ async def periodic_followups_job(context: ContextTypes.DEFAULT_TYPE):
             mark_followup_sent(user_id)
         except Exception as e:
             print(f"Не удалось отправить follow-up пользователю {user_id}: {e}")
+
 
 
 if __name__ == "__main__":

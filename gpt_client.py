@@ -295,3 +295,23 @@ async def transcribe_voice(voice_bytes: bytes) -> str:
     )
     text = getattr(resp, "text", "").strip()
     return text
+
+async def generate_soft_upsell_text(
+    lang: str,
+    topic: Optional[str] = None,
+) -> str:
+    """
+    Ненавязчивый апселл внутри ответа.
+    """
+    if lang.startswith("uk"):
+        return (
+            "Якщо захочеш — можемо розібрати це глибше і без обмежень 💡"
+        )
+    elif lang.startswith("en"):
+        return (
+            "If you want, we can go deeper into this without limits 💡"
+        )
+    else:
+        return (
+            "Если хочешь — можем разобрать это глубже, без ограничений 💡"
+        )
