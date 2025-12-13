@@ -1,6 +1,6 @@
 import logging
 import asyncio
-from typing import List, Dict, Set
+from typing import Dict, List, Set
 from contextlib import suppress
 
 from telegram import Update
@@ -24,7 +24,7 @@ from localization import (
     pro_offer_text,
 )
 from gpt_client import ask_gpt_with_image, generate_limit_paywall_text
-from .common import send_smart_answer, send_typing_action
+from .common import send_smart_answer, send_typing_action, get_media_lock
 from .pro import _pro_keyboard
 from .topics import get_current_topic
 
@@ -33,7 +33,14 @@ logger = logging.getLogger(__name__)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    if not msg or not msg.photo:
+    if not msg:
+        return
+
+    # ✅ принимаем и обычное PHOTO, и картинку как DOCUMENT (image/*)
+    is_photo = bool(msg.photo)
+    is_doc_image = bool(msg.document and (msg.document.mime_type or "").startswith("image/"))
+
+    if not is_photo and not is_doc_image:
         return
 
     user = update.effective_user
@@ -42,8 +49,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     touch_last_activity(user.id)
 
-    # защита от альбома
-    if msg.media_group_id is not None:
+    # защита от альбома (для PHOTO)
+    if is_photo and msg.media_group_id is not None:
         media_group_id = msg.media_group_id
         handled_groups: Set[str] = context.chat_data.get("handled_media_groups", set())
         if media_group_id in handled_groups:
@@ -83,9 +90,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not paywall:
             paywall = photo_limit_reached(lang)
 
+        # антидубль
         try:
             if should_send_limit_paywall(user_id, paywall):
                 set_last_paywall_text(user_id, paywall)
+            else:
+                return
         except Exception:
             pass
 
@@ -101,68 +111,81 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Не удалось залогировать photo_limit_reached: %s", e)
         return
 
-    stop_event = asyncio.Event()
-    typing_task = asyncio.create_task(
-        send_typing_action(context.bot, msg.chat_id, stop_event)
-    )
+    # IMPORTANT: синхронизация медиа, чтобы текст не обгонял фото
+    media_lock = get_media_lock(context)
 
-    try:
-        # скачиваем фото
-        photo = msg.photo[-1]
+    async with media_lock:
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(send_typing_action(context.bot, msg.chat_id, stop_event))
+
         try:
-            file = await photo.get_file()
-            bio = await file.download_as_bytearray()
-            image_bytes = bytes(bio)
-        except Exception as e:
-            logger.exception("Ошибка при скачивании фото: %s", e)
-            await msg.reply_text(photo_placeholder_text(lang))
+            # скачиваем фото (PHOTO или DOCUMENT image/*)
             try:
-                log_event(user_id, "photo_download_error", meta=str(e))
-            except Exception:
-                pass
-            return
+                if is_photo:
+                    photo = msg.photo[-1]
+                    file = await photo.get_file()
+                else:
+                    file = await msg.document.get_file()
 
-        user_question = (
-            (msg.caption or "").strip()
-            or context.chat_data.get("last_user_text")
-            or ("Опиши это изображение." if not lang.startswith("uk") else "Опиши це зображення.")
-        )
+                bio = await file.download_as_bytearray()
+                image_bytes = bytes(bio)
+            except Exception as e:
+                logger.exception("Ошибка при скачивании фото: %s", e)
+                await msg.reply_text(photo_placeholder_text(lang))
+                try:
+                    log_event(user_id, "photo_download_error", meta=str(e))
+                except Exception:
+                    pass
+                return
 
-        history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get("history_by_topic", {})
-        history = history_by_topic.get(topic, [])
-
-        try:
-            answer = await ask_gpt_with_image(
-                history=history,
-                lang=lang,
-                image_bytes=image_bytes,
-                user_question=user_question,
+            user_question = (
+                (msg.caption or "").strip()
+                or context.chat_data.get("last_user_text")
+                or ("Опиши это изображение." if not lang.startswith("uk") else "Опиши це зображення.")
             )
-        except Exception as e:
-            logger.exception("Ошибка при запросе к OpenAI (image): %s", e)
-            answer = photo_placeholder_text(lang)
+
+            history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get("history_by_topic", {})
+            history = history_by_topic.get(topic, [])
+
+            # ДО запроса фиксируем, что пришло фото (чтобы контекст не терялся)
+            history.append({"role": "user", "content": f"[PHOTO] {user_question}"})
+            if len(history) > MAX_HISTORY_MESSAGES:
+                history = history[-MAX_HISTORY_MESSAGES:]
+
             try:
-                log_event(user_id, "photo_gpt_error", meta=str(e))
+                answer = await ask_gpt_with_image(
+                    history=history,
+                    lang=lang,
+                    image_bytes=image_bytes,
+                    user_question=user_question,
+                )
+            except Exception as e:
+                logger.exception("Ошибка при запросе к OpenAI (image): %s", e)
+                answer = photo_placeholder_text(lang)
+                try:
+                    log_event(user_id, "photo_gpt_error", meta=str(e))
+                except Exception:
+                    pass
+
+            history.append({"role": "assistant", "content": answer})
+            if len(history) > MAX_HISTORY_MESSAGES:
+                history = history[-MAX_HISTORY_MESSAGES:]
+
+            history_by_topic[topic] = history
+            context.chat_data["history_by_topic"] = history_by_topic
+
+            # ✅ подсказка текстовому хендлеру: "медиа только что было"
+            context.chat_data["last_media_ts"] = asyncio.get_event_loop().time()
+            context.chat_data["last_image_ok"] = True
+
+            try:
+                log_event(user_id, "photo")
             except Exception:
                 pass
 
-        history.append({"role": "user", "content": user_question})
-        history.append({"role": "assistant", "content": answer})
-
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
-
-        history_by_topic[topic] = history
-        context.chat_data["history_by_topic"] = history_by_topic
-
-        try:
-            log_event(user_id, "photo")
-        except Exception:
-            pass
-
-    finally:
-        stop_event.set()
-        with suppress(Exception):
-            await typing_task
+        finally:
+            stop_event.set()
+            with suppress(Exception):
+                await typing_task
 
     await send_smart_answer(msg, answer)

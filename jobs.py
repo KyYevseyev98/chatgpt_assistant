@@ -1,5 +1,6 @@
+# jobs.py
 from typing import Any, Dict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from telegram.ext import Application, ContextTypes
 
@@ -55,8 +56,11 @@ async def first_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         _pro_until, last_activity_at, last_followup_at, followup_stage
     ) = get_user(user_id)
 
+    # если юзер уже что-то написал после /start — не шлём
     if last_activity_at != activity_snapshot:
         return
+
+    # если уже отправляли что-то — не шлём
     if last_followup_at is not None or followup_stage > 0:
         return
 
@@ -106,21 +110,36 @@ async def limit_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     mem = get_user_memory_snapshot(user_id)
-    # если нет факта лимита — не отправляем
-    if not mem.get("last_limit_topic") or not mem.get("last_limit_type"):
+
+    # должен быть факт лимита + факт paywall
+    if not mem.get("last_limit_type") or not mem.get("last_paywall_at"):
         return
 
-    user_profile = get_followup_personalization_snapshot(user_id)
-
-    # если человек уже активничал — не спамим
-    last_activity_at = mem.get("last_activity_at")
-    if last_activity_at:
+    # лимит должен быть "свежим" (например, за последние 6 часов)
+    last_limit_at = mem.get("last_limit_at")
+    if last_limit_at:
         try:
-            dt_act = datetime.fromisoformat(last_activity_at)
-            if (datetime.utcnow() - dt_act).total_seconds() < 10 * 60:
+            dt_limit = datetime.fromisoformat(last_limit_at)
+            if (datetime.utcnow() - dt_limit).total_seconds() > 6 * 3600:
                 return
         except Exception:
             pass
+
+    # антиспам: если юзер активничал недавно — не шлём
+    try:
+        (
+            _uid, _used_text, _last_date, _is_pro, _used_photos,
+            _pro_until, last_activity_at, _last_followup_at, _followup_stage
+        ) = get_user(user_id)
+
+        if last_activity_at:
+            dt_act = datetime.fromisoformat(last_activity_at)
+            if (datetime.utcnow() - dt_act).total_seconds() < 10 * 60:
+                return
+    except Exception:
+        pass
+
+    user_profile = get_followup_personalization_snapshot(user_id)
 
     text = await generate_followup_text(
         lang=lang,

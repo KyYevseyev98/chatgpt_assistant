@@ -8,6 +8,35 @@ from telegram.constants import ChatAction
 logger = logging.getLogger(__name__)
 
 
+# -------------------- MEDIA LOCK (ВАЖНО) --------------------
+def get_media_lock(context) -> asyncio.Lock:
+    """
+    Один общий lock на чат, чтобы текст не обгонял обработку фото/voice.
+    """
+    lock = context.chat_data.get("media_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        context.chat_data["media_lock"] = lock
+    return lock
+
+
+async def wait_for_media_if_needed(context) -> None:
+    """
+    Если в данный момент идёт обработка photo/voice — ждём, пока закончится.
+    """
+    lock = context.chat_data.get("media_lock")
+    if not lock:
+        return
+    try:
+        if lock.locked():
+            await lock.acquire()
+            lock.release()
+    except Exception:
+        # если что-то пошло не так — не ломаем чат
+        return
+
+
+# -------------------- SMART SENDER --------------------
 def split_answer_into_blocks(answer: str):
     """
     Делит ответ на блоки:
@@ -37,24 +66,13 @@ def split_answer_into_blocks(answer: str):
             if not in_code:
                 # открытие блока кода
                 if buf:
-                    blocks.append(
-                        {
-                            "type": "text",
-                            "content": "".join(buf),
-                        }
-                    )
+                    blocks.append({"type": "text", "content": "".join(buf)})
                     buf = []
                 in_code = True
                 code_lang = fence_lang
             else:
                 # закрытие блока кода
-                blocks.append(
-                    {
-                        "type": "code",
-                        "content": "".join(buf),
-                        "lang": code_lang,
-                    }
-                )
+                blocks.append({"type": "code", "content": "".join(buf), "lang": code_lang})
                 buf = []
                 in_code = False
                 code_lang = None
@@ -78,16 +96,14 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
     """
     "Умная" отправка ответа:
     - делим текст на блоки (обычный текст + ```код```),
-    - текстовые блоки отправляем как HTML (поддержка <b>, <i> и т.п.),
+    - текстовые блоки отправляем как HTML,
     - кодовые блоки — отдельными сообщениями <pre><code>…</code></pre>.
 
-    reply_markup (клавиатура) вешаем только к ПЕРВОМУ текстовому сообщению,
-    чтобы кнопки не дублировались.
+    reply_markup (клавиатура) вешаем только к ПЕРВОМУ текстовому сообщению.
     """
     answer = answer or ""
     blocks = split_answer_into_blocks(answer)
 
-    # если разметки нет — одно сообщение целиком
     if not blocks:
         await message.reply_text(
             answer,
@@ -106,7 +122,6 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
             continue
 
         if btype == "code":
-            # отправляем код отдельным сообщением, красиво оформленным
             code_text = escape(content)
             html_code = f"<pre><code>{code_text}</code></pre>"
             try:
@@ -119,7 +134,6 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
                 logger.warning("Не удалось отправить код блоком, шлём plain: %s", e)
                 await message.reply_text(content)
         else:
-            # обычный текстовый блок (с <b>, эмодзи и т.п.)
             try:
                 if not first_text_sent:
                     await message.reply_text(
@@ -136,7 +150,6 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
                         disable_web_page_preview=True,
                     )
             except Exception as e:
-                # если телега ругнулась на HTML (например, сломанный тег) — шлём как plain
                 logger.warning("Ошибка при отправке HTML-блока, шлём plain: %s", e)
                 if not first_text_sent:
                     await message.reply_text(content, reply_markup=reply_markup)
@@ -148,14 +161,10 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
 async def send_typing_action(bot, chat_id: int, stop_event: asyncio.Event):
     """
     Пока stop_event не выставлен — каждые ~4 сек отправляем 'typing'.
-    Telegram держит индикатор 'печатает...' ~5 секунд после каждого вызова.
     """
     try:
         while not stop_event.is_set():
-            await bot.send_chat_action(
-                chat_id=chat_id,
-                action=ChatAction.TYPING,
-            )
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             await asyncio.sleep(4)
     except Exception as e:
         logger.warning("Ошибка в send_typing_action: %s", e)

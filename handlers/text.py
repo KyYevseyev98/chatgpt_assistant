@@ -33,7 +33,7 @@ from gpt_client import (
 )
 from jobs import schedule_first_followup, schedule_limit_followup
 
-from .common import send_smart_answer
+from .common import send_smart_answer, wait_for_media_if_needed
 from .pro import _pro_keyboard
 from .topics import get_current_topic
 
@@ -66,10 +66,7 @@ def _build_user_text_with_reply(msg: Message, lang: str) -> str:
         header_other = "Сообщение, на которое я отвечаю:"
         header_me = "Мой комментарий или вопрос:"
 
-    combined = (
-        f"{header_other}\n\"{replied_text}\"\n\n"
-        f"{header_me}\n{base_text}"
-    )
+    combined = f'{header_other}\n"{replied_text}"\n\n{header_me}\n{base_text}'
     return combined.strip()
 
 
@@ -82,6 +79,9 @@ async def _flush_text_batch(
         await asyncio.sleep(BATCH_DELAY_SEC)
     except Exception:
         return
+
+    # если фото/войс ещё крутится — ждём, чтобы история была консистентной
+    await wait_for_media_if_needed(context)
 
     chat_data = context.chat_data
     batch: List[Dict[str, Any]] = chat_data.get("pending_batch") or []
@@ -245,15 +245,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     topic = get_current_topic(context)
 
+    # если фото/войс ещё обрабатывается — ждём, чтобы история не была "пустой"
+    await wait_for_media_if_needed(context)
+
     # лимит
     if not check_limit(user_id, is_photo=False):
-        # сохраняем "упор в лимит"
         try:
             set_last_limit_info(user_id, topic=topic, limit_type="text")
         except Exception:
             pass
 
-        # адаптивный paywall + кнопки
         paywall = ""
         try:
             prof = get_followup_personalization_snapshot(user_id)
@@ -267,14 +268,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             paywall = ""
 
-        # fallback если GPT не дал текст
         if not paywall:
             paywall = text_limit_reached(lang)
 
-        # защита от дубля
+        # антидубль: если нельзя слать — просто выходим (без спама)
         try:
-            if should_send_limit_paywall(user_id, paywall):
-                set_last_paywall_text(user_id, paywall)
+            if not should_send_limit_paywall(user_id, paywall):
+                return
         except Exception:
             pass
 
@@ -285,7 +285,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=_pro_keyboard(lang),
         )
 
-        # планируем follow-up после лимита (если job_queue есть)
+        try:
+            set_last_paywall_text(user_id, paywall)
+        except Exception:
+            pass
+
         try:
             schedule_limit_followup(context.application, user_id, lang)
         except Exception:
@@ -322,7 +326,5 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     batch_task = chat_data.get("batch_task")
     if batch_task is None or batch_task.done():
-        task = context.application.create_task(
-            _flush_text_batch(context, msg.chat_id, user_id)
-        )
+        task = context.application.create_task(_flush_text_batch(context, msg.chat_id, user_id))
         chat_data["batch_task"] = task

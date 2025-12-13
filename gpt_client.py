@@ -67,7 +67,6 @@ def lang_instruction(lang: str) -> str:
         )
 
 
-# --- Базовый характер и контекст Foxy ---
 def _base_system_prompt() -> str:
     return (
         "Ты — Foxy, умный и дружелюбный AI-ассистент внутри Telegram-бота.\n"
@@ -89,7 +88,6 @@ def _base_system_prompt() -> str:
     )
 
 
-# --- Few-shot примеры ---
 FOXY_EXAMPLES: List[Dict[str, str]] = [
     {
         "role": "user",
@@ -109,7 +107,6 @@ FOXY_EXAMPLES: List[Dict[str, str]] = [
 ]
 
 
-# -------------------- ОСНОВНОЙ GPT --------------------
 async def ask_gpt(history: List[Dict[str, str]], lang: str) -> str:
     system_prompt = _base_system_prompt() + "\n" + lang_instruction(lang)
 
@@ -124,7 +121,6 @@ async def ask_gpt(history: List[Dict[str, str]], lang: str) -> str:
     return resp.choices[0].message.content.strip()
 
 
-# -------------------- SOFT UPSELL (внутри ответа) --------------------
 async def generate_soft_upsell_text(lang: str, topic: Optional[str] = None) -> str:
     if lang.startswith("uk"):
         return "Якщо захочеш — можемо розібрати це глибше і без обмежень 💡"
@@ -134,7 +130,6 @@ async def generate_soft_upsell_text(lang: str, topic: Optional[str] = None) -> s
         return "Если хочешь — можем разобрать это глубже, без ограничений 💡"
 
 
-# -------------------- PAYWALL: АДАПТИВНЫЙ ДОЖИМ PRO --------------------
 def _topic_hint(topic: Optional[str], lang: str) -> str:
     topic = (topic or "").strip().lower()
     if topic == "fitness":
@@ -166,7 +161,6 @@ async def generate_limit_paywall_text(
     if len(last_user_message) > 400:
         last_user_message = last_user_message[:400]
 
-    # профиль — опционально, но если есть, можно намекнуть на привычку юзера
     prof = user_profile or {}
     total_messages = int(prof.get("total_messages") or 0)
     total_photos = int(prof.get("total_photos") or 0)
@@ -183,6 +177,8 @@ async def generate_limit_paywall_text(
     if limit_type not in ("text", "photo", "voice"):
         limit_type = "text"
 
+    # ✅ ВАЖНО: НЕ говорим "контекст потеряется" (это выглядит как обман)
+    # Говорим честно: можно продолжить сейчас / без ограничений / глубже разбор.
     system_prompt = (
         "Ты — Foxy, дружелюбный ассистент в Telegram.\n"
         "Пользователь упёрся в бесплатный лимит.\n"
@@ -191,9 +187,10 @@ async def generate_limit_paywall_text(
         "Нельзя:\n"
         "- обещать невозможное;\n"
         "- давить 'купи', 'срочно', 'последний шанс';\n"
-        "- писать длинные простыни.\n"
+        "- писать длинные простыни;\n"
+        "- говорить, что 'контекст потеряется' или что free 'хуже хранит диалог'.\n"
         "Можно:\n"
-        "- подчеркнуть выгоду: не терять контекст, продолжить прямо сейчас, глубже разбор.\n"
+        "- подчеркнуть выгоду: продолжить прямо сейчас, глубже разбор, без ограничений по сообщениям/фото.\n"
         "Тон: живо, по делу.\n"
         f"{lang_block}\n"
         f"Тип лимита: {limit_type}.\n"
@@ -216,7 +213,6 @@ async def generate_limit_paywall_text(
     return resp.choices[0].message.content.strip()
 
 
-# -------------------- FOLLOW-UP: рассылки/пинги --------------------
 async def generate_followup_text(
     lang: str,
     ignored_days: int,
@@ -226,11 +222,6 @@ async def generate_followup_text(
     last_followup_text: Optional[str] = None,
     user_profile: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    1–3 коротких предложения.
-    stage: 0..n (обычные фоллоу-апы)
-    stage=99 (после лимита)
-    """
     last_user_message = (last_user_message or "").strip()
     last_bot_message = (last_bot_message or "").strip()
     last_followup_text = (last_followup_text or "").strip()
@@ -244,7 +235,6 @@ async def generate_followup_text(
 
     prof = user_profile or {}
     topic_counts = prof.get("topic_counts") or {}
-    # попробуем вытащить "самую частую" тему для аккуратного намёка
     best_topic = None
     try:
         if isinstance(topic_counts, dict) and topic_counts:
@@ -275,14 +265,12 @@ async def generate_followup_text(
 
     hint = ""
     if stage == 99:
-        # follow-up после лимита
         hint = (
             "Это follow-up после того, как пользователь упёрся в лимит и ушёл.\n"
             "Сообщение должно быть мягким: продолжить мысль/помочь закончить разбор.\n"
             "Без слова 'лимит', без давления, без цен.\n"
         )
     else:
-        # обычный follow-up
         hint = "Это обычное напоминание вернуться в диалог.\n"
 
     if best_topic:
@@ -311,7 +299,6 @@ async def generate_followup_text(
     return resp.choices[0].message.content.strip()
 
 
-# -------------------- IMAGE --------------------
 async def ask_gpt_with_image(
     history: List[Dict[str, str]],
     lang: str,
@@ -349,7 +336,6 @@ async def ask_gpt_with_image(
     return resp.choices[0].message.content.strip()
 
 
-# -------------------- VOICE TRANSCRIBE --------------------
 async def transcribe_voice(voice_bytes: bytes) -> str:
     audio_file = BytesIO(voice_bytes)
     audio_file.name = "voice.ogg"

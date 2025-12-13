@@ -43,3 +43,15 @@ _admin_ids_raw = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [
     int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()
 ]
+
+# --- PRO constants aliases (compat layer) ---
+
+# stars
+PRO_STARS_7_DAYS = PRO_WEEK_STARS
+PRO_STARS_30_DAYS = PRO_MONTH_STARS
+PRO_STARS_90_DAYS = PRO_QUARTER_STARS
+
+# days (если где-то используются)
+PRO_DAYS_7 = 7
+PRO_DAYS_30 = 30
+PRO_DAYS_90 = 90

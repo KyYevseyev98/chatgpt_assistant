@@ -1,6 +1,6 @@
 import logging
 import asyncio
-from typing import List, Dict
+from typing import Dict, List
 from contextlib import suppress
 
 from telegram import Update
@@ -18,7 +18,7 @@ from db import (
     set_last_paywall_text,
     should_send_limit_paywall,
 )
-from .common import send_smart_answer, send_typing_action
+from .common import send_smart_answer, send_typing_action, get_media_lock
 from .pro import _pro_keyboard
 from .topics import get_current_topic
 
@@ -62,6 +62,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if should_send_limit_paywall(user_id, paywall):
                 set_last_paywall_text(user_id, paywall)
+            else:
+                return
         except Exception:
             pass
 
@@ -77,65 +79,66 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    stop_event = asyncio.Event()
-    typing_task = asyncio.create_task(
-        send_typing_action(context.bot, msg.chat_id, stop_event)
-    )
+    media_lock = get_media_lock(context)
 
-    try:
-        voice = msg.voice
-        file = await voice.get_file()
-        bio = await file.download_as_bytearray()
-        voice_bytes = bytes(bio)
+    async with media_lock:
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(send_typing_action(context.bot, msg.chat_id, stop_event))
 
         try:
-            transcribed_text = await transcribe_voice(voice_bytes)
-        except Exception as e:
-            logger.exception("Ошибка при расшифровке голосового: %s", e)
-            if lang.startswith("uk"):
-                transcribed_text = "Не вдалося розпізнати голосове повідомлення."
-            elif lang.startswith("en"):
-                transcribed_text = "I couldn’t transcribe this voice message."
-            else:
-                transcribed_text = "Не удалось распознать голосовое сообщение."
+            voice = msg.voice
+            file = await voice.get_file()
+            bio = await file.download_as_bytearray()
+            voice_bytes = bytes(bio)
 
-        # сохраняем как последний текст пользователя
-        context.chat_data["last_user_text"] = transcribed_text
+            try:
+                transcribed_text = await transcribe_voice(voice_bytes)
+            except Exception as e:
+                logger.exception("Ошибка при расшифровке голосового: %s", e)
+                if lang.startswith("uk"):
+                    transcribed_text = "Не вдалося розпізнати голосове повідомлення."
+                elif lang.startswith("en"):
+                    transcribed_text = "I couldn’t transcribe this voice message."
+                else:
+                    transcribed_text = "Не удалось распознать голосовое сообщение."
 
-        history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get("history_by_topic", {})
-        history = history_by_topic.get(topic, [])
+            # сохраняем как последний текст пользователя
+            context.chat_data["last_user_text"] = transcribed_text
 
-        history.append({"role": "user", "content": transcribed_text})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
-        history_by_topic[topic] = history
-        context.chat_data["history_by_topic"] = history_by_topic
+            history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get("history_by_topic", {})
+            history = history_by_topic.get(topic, [])
 
-        try:
-            answer = await ask_gpt(history, lang)
-        except Exception as e:
-            logger.exception("Ошибка при запросе к OpenAI (voice->text): %s", e)
-            if lang.startswith("uk"):
-                answer = "Сталася помилка. Спробуй пізніше."
-            elif lang.startswith("en"):
-                answer = "An error occurred. Try again later."
-            else:
-                answer = "Произошла ошибка. Попробуйте позже."
+            history.append({"role": "user", "content": f"[VOICE] {transcribed_text}"})
+            if len(history) > MAX_HISTORY_MESSAGES:
+                history = history[-MAX_HISTORY_MESSAGES:]
+            history_by_topic[topic] = history
+            context.chat_data["history_by_topic"] = history_by_topic
 
-        history.append({"role": "assistant", "content": answer})
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
-        history_by_topic[topic] = history
-        context.chat_data["history_by_topic"] = history_by_topic
+            try:
+                answer = await ask_gpt(history, lang)
+            except Exception as e:
+                logger.exception("Ошибка при запросе к OpenAI (voice->text): %s", e)
+                if lang.startswith("uk"):
+                    answer = "Сталася помилка. Спробуй пізніше."
+                elif lang.startswith("en"):
+                    answer = "An error occurred. Try again later."
+                else:
+                    answer = "Произошла ошибка. Попробуйте позже."
 
-        try:
-            log_event(user_id, "voice", tokens=len(transcribed_text) if transcribed_text else None)
-        except Exception:
-            pass
+            history.append({"role": "assistant", "content": answer})
+            if len(history) > MAX_HISTORY_MESSAGES:
+                history = history[-MAX_HISTORY_MESSAGES:]
+            history_by_topic[topic] = history
+            context.chat_data["history_by_topic"] = history_by_topic
 
-    finally:
-        stop_event.set()
-        with suppress(Exception):
-            await typing_task
+            try:
+                log_event(user_id, "voice", tokens=len(transcribed_text) if transcribed_text else None)
+            except Exception:
+                pass
+
+        finally:
+            stop_event.set()
+            with suppress(Exception):
+                await typing_task
 
     await send_smart_answer(msg, answer)

@@ -150,6 +150,13 @@ def pro_offer_text(lang: str) -> str:
             + "\n\nВыбери тариф по кнопкам ниже."
         )
 
+def pro_error_text(lang: str) -> str:
+    if lang.startswith("uk"):
+        return "Оплата не пройшла. Спробуй ще раз або обери інший тариф."
+    elif lang.startswith("en"):
+        return "Payment failed. Please try again or choose another plan."
+    else:
+        return "Оплата не прошла. Попробуй ещё раз или выбери другой тариф."
 
 def pro_success_text(lang: str, days: int) -> str:
     if lang.startswith("uk"):
