@@ -5,29 +5,22 @@ from contextlib import suppress
 
 from telegram import Update
 from telegram.ext import ContextTypes
-from .topics import get_current_topic
 
 from config import MAX_HISTORY_MESSAGES
-from localization import (
-    get_lang,
-    text_limit_reached,
-)
-from gpt_client import (
-    ask_gpt,
-    transcribe_voice,
-)
-
+from localization import get_lang, text_limit_reached, pro_offer_text
+from gpt_client import ask_gpt, transcribe_voice, generate_limit_paywall_text
 from db import (
     check_limit,
     log_event,
-    set_traffic_source,
     touch_last_activity,
-    get_followup_state,
-    mark_followup_sent,
+    set_last_limit_info,
+    get_followup_personalization_snapshot,
+    set_last_paywall_text,
+    should_send_limit_paywall,
 )
-
 from .common import send_smart_answer, send_typing_action
 from .pro import _pro_keyboard
+from .topics import get_current_topic
 
 logger = logging.getLogger(__name__)
 
@@ -40,36 +33,61 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     lang = get_lang(user)
-    
-        # фиксируем, что юзер был активен
-    touch_last_activity(user.id)
 
-    # лимит считаем как текстовый запрос
+    touch_last_activity(user.id)
+    topic = get_current_topic(context)
+
     if not check_limit(user_id, is_photo=False):
+        try:
+            set_last_limit_info(user_id, topic=topic, limit_type="voice")
+        except Exception:
+            pass
+
+        paywall = ""
+        try:
+            prof = get_followup_personalization_snapshot(user_id)
+            paywall = await generate_limit_paywall_text(
+                lang=lang,
+                limit_type="voice",
+                topic=topic,
+                last_user_message="(voice message)",
+                user_profile=prof,
+            )
+        except Exception:
+            paywall = ""
+
+        if not paywall:
+            paywall = text_limit_reached(lang)
+
+        try:
+            if should_send_limit_paywall(user_id, paywall):
+                set_last_paywall_text(user_id, paywall)
+        except Exception:
+            pass
+
+        final_text = paywall.strip() + "\n\n" + pro_offer_text(lang)
+
         await msg.reply_text(
-            text_limit_reached(lang),
+            final_text,
             reply_markup=_pro_keyboard(lang),
         )
         try:
             log_event(user_id, "voice_limit_reached")
-        except Exception as e:
-            logger.warning("Не удалось залогировать voice_limit_reached: %s", e)
+        except Exception:
+            pass
         return
 
-    # фоновый typing на всё время обработки
     stop_event = asyncio.Event()
     typing_task = asyncio.create_task(
         send_typing_action(context.bot, msg.chat_id, stop_event)
     )
 
     try:
-        # скачиваем голосовое
         voice = msg.voice
         file = await voice.get_file()
         bio = await file.download_as_bytearray()
         voice_bytes = bytes(bio)
 
-        # 1) расшифровка голосового -> текст
         try:
             transcribed_text = await transcribe_voice(voice_bytes)
         except Exception as e:
@@ -81,26 +99,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 transcribed_text = "Не удалось распознать голосовое сообщение."
 
-
-
-        topic = get_current_topic(context)
-
-        history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get(
-            "history_by_topic", {}
-        )
-        history = history_by_topic.get(topic, [])
-
-        # сохраняем как последний текст пользователя (для фото / контекста)
+        # сохраняем как последний текст пользователя
         context.chat_data["last_user_text"] = transcribed_text
 
+        history_by_topic: Dict[str, List[Dict[str, str]]] = context.chat_data.get("history_by_topic", {})
+        history = history_by_topic.get(topic, [])
+
+        history.append({"role": "user", "content": transcribed_text})
         if len(history) > MAX_HISTORY_MESSAGES:
             history = history[-MAX_HISTORY_MESSAGES:]
-
         history_by_topic[topic] = history
         context.chat_data["history_by_topic"] = history_by_topic
-        history.append({"role": "user", "content": transcribed_text})
 
-        # 2) запрос к GPT
         try:
             answer = await ask_gpt(history, lang)
         except Exception as e:
@@ -113,26 +123,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 answer = "Произошла ошибка. Попробуйте позже."
 
         history.append({"role": "assistant", "content": answer})
-
         if len(history) > MAX_HISTORY_MESSAGES:
             history = history[-MAX_HISTORY_MESSAGES:]
+        history_by_topic[topic] = history
+        context.chat_data["history_by_topic"] = history_by_topic
 
-        context.chat_data["history"] = history
-
-        # логируем голосовое событие
         try:
-            log_event(
-                user_id,
-                "voice",
-                tokens=len(transcribed_text) if transcribed_text else None,
-            )
-        except Exception as e:
-            logger.warning("Не удалось залогировать voice-событие: %s", e)
+            log_event(user_id, "voice", tokens=len(transcribed_text) if transcribed_text else None)
+        except Exception:
+            pass
 
     finally:
         stop_event.set()
         with suppress(Exception):
             await typing_task
 
-    # отвечаем ТЕКСТОМ + отдельные блоки кода (без стриминга)
     await send_smart_answer(msg, answer)

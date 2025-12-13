@@ -1,4 +1,3 @@
-# handlers/text.py
 import logging
 import asyncio
 from typing import List, Dict, Any
@@ -14,7 +13,10 @@ from db import (
     set_traffic_source,
     touch_last_activity,
     set_last_context,
-    set_last_limit_topic,
+    set_last_limit_info,
+    get_followup_personalization_snapshot,
+    set_last_paywall_text,
+    should_send_limit_paywall,
 )
 from localization import (
     get_lang,
@@ -22,12 +24,14 @@ from localization import (
     reset_text,
     forbidden_reply,
     text_limit_reached,
+    pro_offer_text,
 )
 from gpt_client import (
     is_forbidden_topic,
     ask_gpt,
+    generate_limit_paywall_text,
 )
-from jobs import schedule_first_followup
+from jobs import schedule_first_followup, schedule_limit_followup
 
 from .common import send_smart_answer
 from .pro import _pro_keyboard
@@ -124,7 +128,7 @@ async def _flush_text_batch(
         else:
             answer = "Произошла ошибка. Попробуйте позже."
 
-        # --- мягкий апселл (НЕ всегда) ---
+    # мягкий апселл
     from db import should_soft_upsell
     from gpt_client import generate_soft_upsell_text
 
@@ -135,7 +139,6 @@ async def _flush_text_batch(
         except Exception:
             pass
 
-    # добавляем ответ ассистента в историю
     history.append({"role": "assistant", "content": answer})
     if len(history) > MAX_HISTORY_MESSAGES:
         history = history[-MAX_HISTORY_MESSAGES:]
@@ -143,7 +146,7 @@ async def _flush_text_batch(
     chat_data["history_by_topic"] = history_by_topic
     chat_data["history"] = history
 
-    # ✅ сохраняем память для персонализации follow-up
+    # память
     try:
         set_last_context(
             user_id,
@@ -154,7 +157,7 @@ async def _flush_text_batch(
     except Exception as e:
         logger.warning("Не удалось сохранить last_context: %s", e)
 
-    # ✅ логируем событие text (topic/lang — в профиль)
+    # лог
     try:
         log_event(
             user_id,
@@ -230,7 +233,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_lang(user)
 
     touch_last_activity(user_id)
-
     context.chat_data["last_user_text"] = raw_text
 
     if is_forbidden_topic(raw_text):
@@ -245,15 +247,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # лимит
     if not check_limit(user_id, is_photo=False):
+        # сохраняем "упор в лимит"
         try:
-            set_last_limit_topic(user_id, topic)
+            set_last_limit_info(user_id, topic=topic, limit_type="text")
         except Exception:
             pass
 
+        # адаптивный paywall + кнопки
+        paywall = ""
+        try:
+            prof = get_followup_personalization_snapshot(user_id)
+            paywall = await generate_limit_paywall_text(
+                lang=lang,
+                limit_type="text",
+                topic=topic,
+                last_user_message=raw_text,
+                user_profile=prof,
+            )
+        except Exception:
+            paywall = ""
+
+        # fallback если GPT не дал текст
+        if not paywall:
+            paywall = text_limit_reached(lang)
+
+        # защита от дубля
+        try:
+            if should_send_limit_paywall(user_id, paywall):
+                set_last_paywall_text(user_id, paywall)
+        except Exception:
+            pass
+
+        final_text = paywall.strip() + "\n\n" + pro_offer_text(lang)
+
         await msg.reply_text(
-            text_limit_reached(lang),
+            final_text,
             reply_markup=_pro_keyboard(lang),
         )
+
+        # планируем follow-up после лимита (если job_queue есть)
+        try:
+            schedule_limit_followup(context.application, user_id, lang)
+        except Exception:
+            pass
 
         try:
             log_event(

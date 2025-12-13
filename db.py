@@ -1,4 +1,3 @@
-# db.py
 import sqlite3
 import datetime as dt
 import json
@@ -13,32 +12,19 @@ from config import (
 
 # --- формула дней игнора для follow-up ---
 def required_ignored_days_for_stage(stage: int) -> int:
-    """
-    Сколько дней игнора нужно, чтобы отправить follow-up для данного stage.
-    stage: 0 -> первый follow-up, 1 -> второй и т.д.
-    Формула: дни игнора растут всё медленнее (интервал между рассылками растёт на +3 дня).
-    """
     n = stage + 1
-    # D(n) = 2 + 3 * (n-1)*n/2
     return 2 + (3 * (n - 1) * n) // 2
 
 
-# --- глобальное соединение с БД ---
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 
-
-# ---------------------------------------------------------------------------
-# INIT + MIGRATIONS
-# ---------------------------------------------------------------------------
 
 def init_db() -> None:
     """
     Создаёт таблицы users, events, pro_payments, user_profiles
     и выполняет безопасные миграции.
     """
-
-    # --- users ---
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -52,7 +38,18 @@ def init_db() -> None:
 
             last_activity_at TEXT,
             last_followup_at TEXT,
-            followup_stage INTEGER DEFAULT 0
+            followup_stage INTEGER DEFAULT 0,
+
+            last_topic TEXT,
+            last_user_message TEXT,
+            last_bot_message TEXT,
+            last_followup_text TEXT,
+            last_limit_topic TEXT,
+
+            last_limit_type TEXT,
+            last_limit_at TEXT,
+            last_paywall_text TEXT,
+            last_paywall_at TEXT
         )
         """
     )
@@ -74,12 +71,17 @@ def init_db() -> None:
     _add_user_col("last_followup_at", "last_followup_at TEXT")
     _add_user_col("followup_stage", "followup_stage INTEGER DEFAULT 0")
 
-    # 👇 Новая "память" для рассылок и LTV
     _add_user_col("last_topic", "last_topic TEXT")
     _add_user_col("last_user_message", "last_user_message TEXT")
     _add_user_col("last_bot_message", "last_bot_message TEXT")
     _add_user_col("last_followup_text", "last_followup_text TEXT")
     _add_user_col("last_limit_topic", "last_limit_topic TEXT")
+
+    # NEW
+    _add_user_col("last_limit_type", "last_limit_type TEXT")
+    _add_user_col("last_limit_at", "last_limit_at TEXT")
+    _add_user_col("last_paywall_text", "last_paywall_text TEXT")
+    _add_user_col("last_paywall_at", "last_paywall_at TEXT")
 
     # --- events ---
     cur.execute(
@@ -132,10 +134,10 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS user_profiles (
             user_id INTEGER PRIMARY KEY,
 
-            segments TEXT,                 -- legacy: "a,b,c"
-            segments_json TEXT,            -- new: {"nutrition":0.8,...}
+            segments TEXT,
+            segments_json TEXT,
 
-            topic_counts_json TEXT,        -- {"nutrition": 10, "fitness": 3}
+            topic_counts_json TEXT,
             total_messages INTEGER DEFAULT 0,
             total_photos INTEGER DEFAULT 0,
             total_voice INTEGER DEFAULT 0,
@@ -151,7 +153,6 @@ def init_db() -> None:
     )
     conn.commit()
 
-    # миграции user_profiles
     cur.execute("PRAGMA table_info(user_profiles)")
     prof_cols = [row[1] for row in cur.fetchall()]
 
@@ -166,7 +167,6 @@ def init_db() -> None:
     _add_prof_col("profile_updated_at", "profile_updated_at TEXT")
     _add_prof_col("messages_since_profile_update", "messages_since_profile_update INTEGER DEFAULT 0")
 
-    # --- индексы (ускоряем рост) ---
     _create_indexes()
 
 
@@ -179,13 +179,8 @@ def _create_indexes() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_last_followup ON users(last_followup_at)")
         conn.commit()
     except Exception:
-        # не критично
         pass
 
-
-# ---------------------------------------------------------------------------
-# USERS базовые
-# ---------------------------------------------------------------------------
 
 def _ensure_user_profile(user_id: int) -> None:
     cur.execute(
@@ -213,20 +208,6 @@ def get_user(
     int, int, str, int, int,
     Optional[str], Optional[str], Optional[str], int
 ]:
-    """
-    Возвращает legacy-кортеж (НЕ ломаем текущий код):
-    (
-        user_id,
-        used_text,
-        last_date,
-        is_pro_flag,
-        used_photos,
-        pro_until_iso,
-        last_activity_at_iso,
-        last_followup_at_iso,
-        followup_stage
-    )
-    """
     cur.execute(
         """
         SELECT user_id,
@@ -263,11 +244,19 @@ def get_user(
                 last_user_message,
                 last_bot_message,
                 last_followup_text,
-                last_limit_topic
+                last_limit_topic,
+                last_limit_type,
+                last_limit_at,
+                last_paywall_text,
+                last_paywall_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, 0, today, 0, 0, None, None, None, None, 0, None, None, None, None, None),
+            (
+                user_id, 0, today, 0, 0, None, None, None, None, 0,
+                None, None, None, None, None,
+                None, None, None, None
+            ),
         )
         conn.commit()
         _ensure_user_profile(user_id)
@@ -288,9 +277,6 @@ def update_user(
     last_followup_at: Optional[str],
     followup_stage: int,
 ) -> None:
-    """
-    legacy update (НЕ ломаем текущий код)
-    """
     cur.execute(
         """
         UPDATE users
@@ -392,7 +378,7 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
                 pro_until, last_activity_at, last_followup_at, followup_stage
             )
 
-    # новый день — сброс счётчиков
+    # новый день — сброс
     if last_date != today:
         used_text = 0
         used_photos = 0
@@ -412,7 +398,7 @@ def check_limit(user_id: int, is_photo: bool = False) -> bool:
         )
         return False
 
-    # text
+    # text/voice
     if used_text < FREE_TEXT_LIMIT_PER_DAY:
         used_text += 1
         update_user(
@@ -482,16 +468,12 @@ def get_all_users_for_followup():
                followup_stage
         FROM users
         WHERE last_activity_at IS NOT NULL
-          AND (last_followup_at IS NOT NULL OR followup_stage > 0)
         """
     )
     return cur.fetchall()
 
 
-# ---------------------------------------------------------------------------
-# NEW: “память” под рассылки / персонализацию
-# ---------------------------------------------------------------------------
-
+# -------------------- MEMORY --------------------
 def set_last_context(
     user_id: int,
     *,
@@ -499,12 +481,6 @@ def set_last_context(
     last_user_message: Optional[str] = None,
     last_bot_message: Optional[str] = None,
 ) -> None:
-    """
-    Сохраняем минимальный контекст диалога для follow-up:
-    - last_topic
-    - last_user_message (обрезаем)
-    - last_bot_message (обрезаем)
-    """
     get_user(user_id)
 
     def _cut(s: Optional[str], n: int) -> Optional[str]:
@@ -533,9 +509,6 @@ def set_last_context(
 
 
 def set_last_followup_text(user_id: int, text: str) -> None:
-    """
-    Чтобы GPT не повторял один и тот же follow-up.
-    """
     get_user(user_id)
     txt = (text or "").strip()
     if len(txt) > 600:
@@ -547,24 +520,50 @@ def set_last_followup_text(user_id: int, text: str) -> None:
     conn.commit()
 
 
-def set_last_limit_topic(user_id: int, topic: Optional[str]) -> None:
+def set_last_limit_info(user_id: int, *, topic: Optional[str], limit_type: str) -> None:
     get_user(user_id)
     t = (topic or "").strip()[:64] if topic else None
+    limit_type = (limit_type or "").strip()[:16]
+    now_iso = dt.datetime.utcnow().isoformat()
     cur.execute(
-        "UPDATE users SET last_limit_topic = ? WHERE user_id = ?",
-        (t, user_id),
+        """
+        UPDATE users
+        SET last_limit_topic = ?,
+            last_limit_type = ?,
+            last_limit_at = ?
+        WHERE user_id = ?
+        """,
+        (t, limit_type, now_iso, user_id),
+    )
+    conn.commit()
+
+
+def set_last_paywall_text(user_id: int, text: str) -> None:
+    get_user(user_id)
+    txt = (text or "").strip()
+    if len(txt) > 900:
+        txt = txt[:900]
+    now_iso = dt.datetime.utcnow().isoformat()
+    cur.execute(
+        """
+        UPDATE users
+        SET last_paywall_text = ?,
+            last_paywall_at = ?
+        WHERE user_id = ?
+        """,
+        (txt, now_iso, user_id),
     )
     conn.commit()
 
 
 def get_user_memory_snapshot(user_id: int) -> Dict[str, Any]:
-    """
-    Слепок памяти из users (для follow-up генерации).
-    """
     get_user(user_id)
     cur.execute(
         """
-        SELECT last_topic, last_user_message, last_bot_message, last_followup_text, last_limit_topic
+        SELECT last_topic, last_user_message, last_bot_message,
+               last_followup_text, last_limit_topic,
+               last_limit_type, last_limit_at,
+               last_paywall_text, last_paywall_at
         FROM users
         WHERE user_id = ?
         """,
@@ -579,13 +578,14 @@ def get_user_memory_snapshot(user_id: int) -> Dict[str, Any]:
         "last_bot_message": row[2],
         "last_followup_text": row[3],
         "last_limit_topic": row[4],
+        "last_limit_type": row[5],
+        "last_limit_at": row[6],
+        "last_paywall_text": row[7],
+        "last_paywall_at": row[8],
     }
 
 
-# ---------------------------------------------------------------------------
-# PROFILES: сегменты + счётчики тем + триггеры
-# ---------------------------------------------------------------------------
-
+# -------------------- PROFILES --------------------
 def _safe_load_json(s: Optional[str], fallback):
     if not s:
         return fallback
@@ -606,13 +606,6 @@ def update_user_profile_on_event(
     pro_payment_increment: int = 0,
     last_limit_type: Optional[str] = None,
 ) -> None:
-    """
-    Обновляет профиль пользователя (user_profiles) при событии:
-    - total_* счётчики
-    - segments (legacy) + segments_json (new)
-    - topic_counts_json
-    - messages_since_profile_update
-    """
     _ensure_user_profile(user_id)
 
     cur.execute(
@@ -668,7 +661,6 @@ def update_user_profile_on_event(
     if lang:
         last_lang_db = lang
 
-    # legacy segments (строка)
     existing_segments = [s for s in (segments_str or "").split(",") if s.strip()]
     if segments:
         for s in segments:
@@ -677,7 +669,6 @@ def update_user_profile_on_event(
                 existing_segments.append(s)
     new_segments_str = ",".join(existing_segments)
 
-    # segments_json (скоринговый)
     seg_map: Dict[str, float] = _safe_load_json(segments_json_str, {})
     if segment_scores:
         for k, v in segment_scores.items():
@@ -687,10 +678,8 @@ def update_user_profile_on_event(
                 val = float(v)
             except Exception:
                 continue
-            # мягко копим (макс 1.0)
             seg_map[k] = max(seg_map.get(k, 0.0), min(1.0, val))
 
-    # topic_counts_json
     topic_counts: Dict[str, int] = _safe_load_json(topic_counts_json_str, {})
     if topic and event_type == "text":
         t = topic.strip()
@@ -731,29 +720,7 @@ def update_user_profile_on_event(
     conn.commit()
 
 
-def reset_profile_update_counter(user_id: int) -> None:
-    """
-    Вызывай после того, как ты сделал "дорогое" обновление профиля (через GPT),
-    чтобы не делать это каждые 2 сообщения.
-    """
-    _ensure_user_profile(user_id)
-    now = dt.datetime.utcnow().isoformat()
-    cur.execute(
-        """
-        UPDATE user_profiles
-        SET profile_updated_at = ?,
-            messages_since_profile_update = 0
-        WHERE user_id = ?
-        """,
-        (now, user_id),
-    )
-    conn.commit()
-
-
 def get_user_profile_snapshot(user_id: int) -> Dict[str, Any]:
-    """
-    Слепок профиля пользователя для GPT (для рассылок).
-    """
     _ensure_user_profile(user_id)
 
     cur.execute(
@@ -792,7 +759,6 @@ def get_user_profile_snapshot(user_id: int) -> Dict[str, Any]:
         messages_since_profile_update,
     ) = row
 
-    # traffic_source
     cur.execute("SELECT traffic_source FROM users WHERE user_id = ?", (user_id,))
     row2 = cur.fetchone()
     traffic_source = row2[0] if row2 else None
@@ -817,10 +783,7 @@ def get_user_profile_snapshot(user_id: int) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# EVENTS + PAYMENTS
-# ---------------------------------------------------------------------------
-
+# -------------------- EVENTS + PAYMENTS --------------------
 def log_event(
     user_id: int,
     event_type: str,
@@ -833,19 +796,9 @@ def log_event(
     segments: Optional[List[str]] = None,
     segment_scores: Optional[Dict[str, float]] = None,
 ) -> None:
-    """
-    Пишет запись в events и обновляет user_profiles.
-    """
     (
-        _uid,
-        _used_text,
-        _last_date,
-        _is_pro,
-        _used_photos,
-        pro_until,
-        _last_activity_at,
-        _last_followup_at,
-        _followup_stage,
+        _uid, _used_text, _last_date, _is_pro, _used_photos,
+        pro_until, *_rest
     ) = get_user(user_id)
     is_pro_active = 1 if _pro_active(pro_until) else 0
 
@@ -872,9 +825,6 @@ def log_event(
 
 
 def log_pro_payment(user_id: int, stars: int, days: int) -> None:
-    """
-    Логируем покупку PRO и обновляем профиль.
-    """
     cur.execute("SELECT traffic_source FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
     traffic_source = row[0] if row and row[0] is not None else None
@@ -897,16 +847,7 @@ def log_pro_payment(user_id: int, stars: int, days: int) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# UTIL: выборки для рассылок
-# ---------------------------------------------------------------------------
-
 def get_followup_personalization_snapshot(user_id: int) -> Dict[str, Any]:
-    """
-    Единый слепок для follow-up:
-    - память из users (последние реплики, тема, лимит)
-    - профиль из user_profiles (сегменты, счётчики, язык)
-    """
     mem = get_user_memory_snapshot(user_id)
     prof = get_user_profile_snapshot(user_id)
     out = {}
@@ -914,34 +855,40 @@ def get_followup_personalization_snapshot(user_id: int) -> Dict[str, Any]:
     out.update(prof or {})
     return out
 
-# ---------------------------------------------------------------------------
-# LTV / SALES TRIGGERS
-# ---------------------------------------------------------------------------
 
+# -------------------- SALES TRIGGERS --------------------
 def should_soft_upsell(user_id: int) -> bool:
-    """
-    Мягкий апселл:
-    - пользователь активен
-    - PRO ещё не покупал
-    - уже есть ценность
-    """
     prof = get_user_profile_snapshot(user_id)
     if not prof:
         return False
-
     if prof.get("pro_payments_count", 0) > 0:
         return False
-
     total_msgs = prof.get("total_messages", 0)
     return total_msgs >= 20 and total_msgs % 5 == 0
 
 
-def should_followup_after_limit(user_id: int) -> bool:
+def should_send_limit_paywall(user_id: int, new_text: str) -> bool:
     """
-    Follow-up после упора в лимит
+    Защита от спама: если paywall тот же самый недавно — не дублируем.
     """
     mem = get_user_memory_snapshot(user_id)
-    if not mem:
+    last_text = (mem.get("last_paywall_text") or "").strip()
+    last_at = mem.get("last_paywall_at")
+
+    if not new_text:
         return False
 
-    return bool(mem.get("last_limit_topic"))
+    # если тот же текст — не шлём
+    if last_text and last_text == new_text.strip():
+        return False
+
+    # если отправляли paywall менее чем 2 минуты назад — не шлём повторно
+    if last_at:
+        try:
+            dt_last = dt.datetime.fromisoformat(last_at)
+            if (dt.datetime.utcnow() - dt_last).total_seconds() < 120:
+                return False
+        except Exception:
+            pass
+
+    return True

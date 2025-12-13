@@ -83,25 +83,20 @@ def _pro_prices_block(lang: str) -> str:
 
 def text_limit_reached(lang: str) -> str:
     if lang.startswith("uk"):
-        base = f"Ви використали безкоштовний денний ліміт у {FREE_TEXT_LIMIT_PER_DAY} текстових повідомлень."
+        return f"Ви використали безкоштовний денний ліміт у {FREE_TEXT_LIMIT_PER_DAY} текстових повідомлень."
     elif lang.startswith("en"):
-        base = f"You’ve used today’s free limit of {FREE_TEXT_LIMIT_PER_DAY} text messages."
+        return f"You’ve used today’s free limit of {FREE_TEXT_LIMIT_PER_DAY} text messages."
     else:
-        base = f"Вы использовали сегодняшний бесплатный лимит в {FREE_TEXT_LIMIT_PER_DAY} текстовых сообщений."
-
-    # сразу даём описание PRO + цены
-    return base + "\n\n" + pro_offer_text(lang)
+        return f"Вы использовали сегодняшний бесплатный лимит в {FREE_TEXT_LIMIT_PER_DAY} текстовых сообщений."
 
 
 def photo_limit_reached(lang: str) -> str:
     if lang.startswith("uk"):
-        base = f"Ви вже використали сьогодні {FREE_PHOTO_LIMIT_PER_DAY} безкоштовний аналіз фото."
+        return f"Ви вже використали сьогодні {FREE_PHOTO_LIMIT_PER_DAY} безкоштовний аналіз фото."
     elif lang.startswith("en"):
-        base = f"You’ve already used your {FREE_PHOTO_LIMIT_PER_DAY} free photo analysis for today."
+        return f"You’ve already used your {FREE_PHOTO_LIMIT_PER_DAY} free photo analysis for today."
     else:
-        base = f"Вы уже использовали сегодня {FREE_PHOTO_LIMIT_PER_DAY} бесплатный анализ фото."
-
-    return base + "\n\n" + pro_offer_text(lang)
+        return f"Вы уже использовали сегодня {FREE_PHOTO_LIMIT_PER_DAY} бесплатный анализ фото."
 
 
 def photo_placeholder_text(lang: str) -> str:
