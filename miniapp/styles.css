@@ -1,0 +1,158 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --card: #171a21;
+  --text: #e9edf1;
+  --muted: #9aa3ad;
+  --accent: #63c3a5;
+  --accent-2: #f5b971;
+  --border: #262b35;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Manrope", "Inter", "Segoe UI", sans-serif;
+  background: radial-gradient(1200px 600px at 20% -10%, #1c2230 0%, var(--bg) 45%);
+  color: var(--text);
+}
+
+.wrap {
+  max-width: 520px;
+  margin: 0 auto;
+  padding: 20px 16px 40px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: 0.2px;
+}
+
+.subtitle {
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  margin-top: 14px;
+}
+
+.card-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.balance-value {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.primary {
+  width: 100%;
+  background: linear-gradient(135deg, var(--accent), #3d8f77);
+  border: none;
+  color: #0b0f14;
+  font-weight: 700;
+  font-size: 16px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.packs {
+  margin-top: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.pack {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #10141a;
+  border: 1px solid var(--border);
+  padding: 12px;
+  border-radius: 12px;
+}
+
+.pack .buy {
+  background: var(--accent-2);
+  color: #121212;
+  border: none;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ref-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+input#refLink {
+  flex: 1;
+  background: #0c0f14;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+#copyBtn {
+  background: #222835;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+.list {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.error {
+  margin-top: 18px;
+  background: #2a1b1b;
+  border: 1px solid #5c2a2a;
+  padding: 12px;
+  border-radius: 12px;
+}
+
+.diagnostics {
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.diag-line {
+  margin-top: 6px;
+  word-break: break-all;
+}
+
+.hidden {
+  display: none;
+}

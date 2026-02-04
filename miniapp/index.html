@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Astra — Кабинет</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="header">
+        <h1>Астра</h1>
+        <div class="subtitle">Кабинет</div>
+      </header>
+
+      <section class="card balance">
+        <div class="card-title">Баланс</div>
+        <div class="balance-value" id="balanceValue">—</div>
+        <div class="muted">Расходуется только при выполнении расклада</div>
+      </section>
+
+      <section class="card">
+        <button id="buyBtn" class="primary">Купить расклады</button>
+        <div id="packs" class="packs hidden"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Пригласить подругу</div>
+        <div class="muted">Скопируй ссылку и отправь подруге</div>
+        <div class="ref-row">
+          <input id="refLink" readonly value="—" />
+          <button id="copyBtn">Скопировать</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Инструкция</div>
+        <ul class="list">
+          <li>Формулируй запрос конкретно: ситуация + период</li>
+          <li>Расклад — это разбор по картам с рекомендациями</li>
+          <li>Баланс тратится только при запуске расклада</li>
+          <li>Бесплатные расклады можно получить через рефералку</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <div class="card-title">Поддержка</div>
+        <a class="link" id="supportLink" href="#">Написать в поддержку</a>
+      </section>
+
+      <section class="error hidden" id="errorBox">
+        Ошибка авторизации. Откройте мини‑апп из Telegram.
+      </section>
+
+      <section class="card diagnostics" id="diagBox">
+        <div class="card-title">Диагностика</div>
+        <div class="diag-line" id="diagTg">tg available: —</div>
+        <div class="diag-line" id="diagUser">user id: —</div>
+        <div class="diag-line" id="diagErr">error: —</div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

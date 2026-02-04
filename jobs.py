@@ -1,6 +1,8 @@
 # jobs.py
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 from datetime import datetime
+import random
+import json
 
 from telegram.ext import Application, ContextTypes
 
@@ -8,11 +10,135 @@ from db import (
     get_user,
     mark_followup_sent,
     set_last_followup_text,
+    set_last_followup_meta,
     get_followup_personalization_snapshot,
     get_user_memory_snapshot,
+    log_event,
 )
 from gpt_client import generate_followup_text
 from localization import start_text
+
+
+# ---------------------------------------------------------
+# Follow-up pools (ignore users)
+# ---------------------------------------------------------
+_INVITE_TOPICS = {
+    "love": [
+        "Кто сейчас думает о тебе",
+        "Есть ли тайная влюблённость",
+        "Любовный прогноз на ближайшие дни",
+        "Кто скоро намекнёт тебе на чувства",
+        "Кто из прошлого всё ещё вспоминает тебя",
+        "Что он/она сейчас чувствует к тебе",
+        "Будет ли неожиданный контакт или сообщение",
+    ],
+    "future": [
+        "На правильном ли ты пути сейчас",
+        "Чем тебя удивит завтрашний день",
+        "Как пройдёт эта неделя",
+        "Что тебя скоро порадует",
+        "Какое приятное событие уже рядом",
+        "На что стоит обратить внимание в ближайшие дни",
+    ],
+    "money": [
+        "Что будет с финансами в этом месяце",
+        "Ждёт ли тебя денежный шанс",
+        "Что важно не упустить в работе или проекте",
+        "Где сейчас твоя точка роста",
+    ],
+}
+
+_INVITE_TEMPLATES = [
+    "Есть ощущение, что тебе может откликнуться тема:\n"
+    "«{topic}».\n"
+    "Если хочешь — мягко посмотрю это через карты.\n"
+    "Я рядом.",
+    "Иногда полезно подсветить важное через расклад.\n"
+    "Могу глянуть по картам тему «{topic}».\n"
+    "Без спешки — как тебе комфортно.\n"
+    "Я рядом 🃏",
+    "Если хочется немного ясности,\n"
+    "могу посмотреть тему «{topic}» через карты.\n"
+    "Спокойно, мягко, без давления.\n"
+    "Я рядом.",
+    "Есть тема, которая часто волнует:\n"
+    "«{topic}».\n"
+    "Если захочешь — сделаю расклад и разберём вместе.\n"
+    "Я рядом ✨",
+]
+
+_CARE_MESSAGES = [
+    "Просто решила напомнить, что я рядом 🙂 Если захочешь поговорить — пиши.",
+    "Как ты сейчас? Иногда полезно просто выговориться, даже без запроса.",
+    "Если захочешь поговорить — я на связи.",
+]
+
+_MICRO_VALUE_MESSAGES = [
+    "Маленькая мысль: если перегруз — не обязательно решать всё сразу. Один честный шаг уже меняет направление.",
+    "Напоминание: даже маленькие шаги сегодня — это большие результаты завтра. Если захочешь поговорить — пиши.",
+]
+
+
+def _pick_invite_topic(last_topic: str) -> Tuple[str, str]:
+    topics = list(_INVITE_TOPICS.keys())
+    if last_topic in topics and len(topics) > 1:
+        topics.remove(last_topic)
+    chosen = random.choice(topics)
+    topic_text = random.choice(_INVITE_TOPICS[chosen])
+    return chosen, topic_text
+
+
+def _build_ignore_followup(user_id: int, stage: int) -> Tuple[str, str, str]:
+    """
+    Returns (text, followup_type, followup_topic)
+    followup_type: tarot_invite | care | micro
+    followup_topic: love | future | money | ""
+    """
+    mem = get_user_memory_snapshot(user_id) or {}
+    last_text = (mem.get("last_followup_text") or "").strip()
+    last_type = (mem.get("last_followup_type") or "").strip()
+    last_topic = (mem.get("last_followup_topic") or "").strip()
+
+    roll = random.random()
+    if roll < 0.8:
+        f_type = "tarot_invite"
+        topic_key, topic_text = _pick_invite_topic(last_topic)
+        template = random.choice(_INVITE_TEMPLATES)
+        text = template.format(topic=topic_text)
+        # avoid repeating exact text
+        if text == last_text:
+            template = random.choice([t for t in _INVITE_TEMPLATES if t != template] or _INVITE_TEMPLATES)
+            text = template.format(topic=topic_text)
+        return text, f_type, topic_key
+
+    if roll < 0.95:
+        f_type = "care"
+        text = random.choice([t for t in _CARE_MESSAGES if t != last_text] or _CARE_MESSAGES)
+        return text, f_type, ""
+
+    f_type = "micro"
+    text = random.choice([t for t in _MICRO_VALUE_MESSAGES if t != last_text] or _MICRO_VALUE_MESSAGES)
+    return text, f_type, ""
+
+
+async def send_ignore_followup(context: ContextTypes.DEFAULT_TYPE, user_id: int, lang: str, stage: int) -> None:
+    text, f_type, f_topic = _build_ignore_followup(user_id, stage)
+    await context.bot.send_message(chat_id=user_id, text=text)
+    try:
+        set_last_followup_text(user_id, text)
+        set_last_followup_meta(user_id, followup_type=f_type, followup_topic=f_topic)
+    except Exception:
+        pass
+    try:
+        log_event(
+            user_id,
+            "followup_sent",
+            meta=json.dumps({"type": f_type, "topic": f_topic, "stage": stage}, ensure_ascii=False),
+            topic="followup",
+        )
+    except Exception:
+        pass
+    mark_followup_sent(user_id)
 
 
 def schedule_first_followup(app: Application, user_id: int, lang: str) -> None:

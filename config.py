@@ -7,17 +7,59 @@ load_dotenv()
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")
 
 DB_PATH = "chatgpt_users.db"
 MODEL_NAME = "gpt-4.1-mini"
 
+FREE_TAROT_LIFETIME = 3
+FREE_TAROT_LIMIT_PER_DAY = 999999
+
 # бесплатные лимиты
-FREE_TEXT_LIMIT_PER_DAY = 20
-FREE_PHOTO_LIMIT_PER_DAY = 1
+FREE_TEXT_LIMIT_PER_DAY = 50
+FREE_PHOTO_LIMIT_PER_DAY = 300
+
+# новые лимиты (без изменения БД)
+FREE_TAROT_FREE_COUNT = 3
+FREE_TEXT_FREE_COUNT = 50
 
 # сколько сообщений контекста помним
-MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MESSAGES = 30
+MAX_HISTORY_CHARS = 6000
+MAX_MESSAGE_CHARS_DB = 2000
+MAX_USER_QUESTION_CHARS = 1200
+PRE_DIALOG_TTL_SEC = 15 * 60
+PRE_DIALOG_MAX_QUESTIONS = 3
 
+# долгосрочная память (без изменения схемы БД)
+LONG_MEMORY_SUMMARY_EVERY = 8
+LONG_MEMORY_SUMMARY_HISTORY = 12
+LONG_MEMORY_MAX_ITEMS = 10
+LONG_MEMORY_MAX_SUMMARIES = 20
+LONG_MEMORY_MAX_EVENTS = 30
+LONG_MEMORY_BLOCK_MAX_CHARS = 900
+
+# Tarot session continuation TTL (seconds)
+TAROT_SESSION_TTL_SEC = 15 * 60
+
+# пользователи без лимитов (по username)
+UNLIMITED_USERNAMES = {
+    "dasha_mitchell",
+    "kirillevseev",
+}
+
+# рефералы
+REFERRAL_REWARD_SPREADS = 3
+
+# пакеты раскладов
+TAROT_PACKS = [
+    {"key": "5", "spreads": 5, "stars": 100},
+    {"key": "25", "spreads": 25, "stars": 250},
+    {"key": "75", "spreads": 75, "stars": 500},
+    {"key": "200", "spreads": 200, "stars": 1000},
+]
 # Тарифы PRO в звёздах
 PRO_WEEK_STARS = 79      # ~1.9$
 PRO_MONTH_STARS = 149    # ~3.6$
@@ -55,3 +97,6 @@ PRO_STARS_90_DAYS = PRO_QUARTER_STARS
 PRO_DAYS_7 = 7
 PRO_DAYS_30 = 30
 PRO_DAYS_90 = 90
+# ограничения БД/истории (чтобы база не раздувалась)
+MAX_DB_MESSAGES_PER_CHAT = 200  # хранить последние N сообщений на чат
+MAX_TAROT_HISTORY_PER_USER = 100  # хранить последние N раскладов на пользователя

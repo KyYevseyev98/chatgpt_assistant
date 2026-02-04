@@ -1,3 +1,5 @@
+# main.py
+
 import logging
 import datetime as dt
 
@@ -7,11 +9,15 @@ from telegram.ext import (
     MessageHandler,
     PreCheckoutQueryHandler,
     CallbackQueryHandler,
-    filters,
     ContextTypes,
+    filters,
 )
+from telegram.request import HTTPXRequest
+from telegram import MenuButtonWebApp, WebAppInfo
 
 from config import TG_TOKEN
+
+# handlers (твои основные)
 from handlers import (
     start,
     reset_dialog,
@@ -22,9 +28,9 @@ from handlers import (
     pro_button,
     precheckout_callback,
     successful_payment_callback,
-    topic_button,
-    topics_command,
+    handle_webapp_data,
 )
+
 
 from db import (
     init_db,
@@ -32,7 +38,8 @@ from db import (
     required_ignored_days_for_stage,
     mark_followup_sent,
 )
-from gpt_client import generate_followup_text
+
+from jobs import send_ignore_followup
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,9 +50,7 @@ logger = logging.getLogger(__name__)
 
 async def periodic_followups_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Периодический обход всех пользователей и отправка follow-up,
-    если они игнорят достаточно долго.
-    Схема дней игнора: required_ignored_days_for_stage(stage).
+    Периодический обход пользователей и follow-up, если они игнорят достаточно долго.
     """
     now = dt.datetime.utcnow()
     users = get_all_users_for_followup()
@@ -74,19 +79,10 @@ async def periodic_followups_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        lang = "ru"  # позже можно брать из профиля/БД
+        lang = "ru"  # потом можно тянуть из user_profiles
 
         try:
-            text = await generate_followup_text(
-                lang=lang,
-                ignored_days=ignored_days,
-                stage=followup_stage,
-                last_user_message=None,
-                last_bot_message=None,
-                last_followup_text=None,
-            )
-            await context.bot.send_message(chat_id=user_id, text=text)
-            mark_followup_sent(user_id)
+            await send_ignore_followup(context, user_id, lang, followup_stage)
         except Exception as e:
             logger.warning("Не удалось отправить follow-up пользователю %s: %s", user_id, e)
 
@@ -94,34 +90,68 @@ async def periodic_followups_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
-    app = ApplicationBuilder().token(TG_TOKEN).build()
+    from telegram.ext import Defaults
+    from telegram.constants import ParseMode
 
-    # команды
+    request = HTTPXRequest(
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
+
+    async def _post_init(app):
+        from config import WEBAPP_URL
+        if WEBAPP_URL:
+            try:
+                await app.bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(text="Кабинет", web_app=WebAppInfo(url=WEBAPP_URL))
+                )
+            except Exception as e:
+                logger.warning("Failed to set menu button: %s", e)
+
+    app = (
+        ApplicationBuilder()
+       .token(TG_TOKEN)
+       .request(request)
+       .defaults(Defaults(parse_mode=ParseMode.HTML))
+       .post_init(_post_init)
+       .build()
+    )
+
+    # -------------------- COMMANDS --------------------
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_dialog))
     app.add_handler(CommandHandler("pro", pro_command))
-    app.add_handler(CommandHandler("topics", topics_command))
 
-    # сообщения
+    # -------------------- CALLBACK BUTTONS --------------------
+    # ✅ кнопки покупки раскладов + реферал
+    app.add_handler(CallbackQueryHandler(pro_button, pattern=r"^(buy_tarot_|ref_)"))
+
+    # -------------------- MESSAGES --------------------
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
 
-    # ✅ фото как PHOTO
+    # фото как PHOTO
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # ✅ фото как DOCUMENT (очень частый кейс: "отправить как файл")
+    # фото как DOCUMENT (когда отправляют "как файл")
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
 
+    # voice
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # кнопки
-    app.add_handler(CallbackQueryHandler(pro_button, pattern=r"^buy_pro_"))
-    app.add_handler(CallbackQueryHandler(topic_button, pattern=r"^(topic_|topics_close)$"))
-
-    # платежи
+    # -------------------- PAYMENTS --------------------
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
-    # periodic follow-ups (раз в час)
+    # -------------------- ERROR HANDLER --------------------
+    async def _on_error(update, context):
+        logger.exception("Update error: %s", context.error)
+
+    app.add_error_handler(_on_error)
+
+    # -------------------- PERIODIC FOLLOWUPS --------------------
     if app.job_queue:
         app.job_queue.run_repeating(
             periodic_followups_job,
@@ -130,7 +160,8 @@ def main():
         )
 
     logger.info("ChatGPT Assistant запущен")
-    app.run_polling()
+    # более устойчивые сетевые настройки + повторные попытки инициализации
+    app.run_polling(bootstrap_retries=10)
 
 
 if __name__ == "__main__":

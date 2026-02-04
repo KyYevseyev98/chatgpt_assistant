@@ -11,6 +11,8 @@ __pycache__/
 
 # локальная база
 chatgpt_users.db
+chatgpt_users.db-shm
+chatgpt_users.db-wal
 
 # временные файлы/загрузки
 downloads/

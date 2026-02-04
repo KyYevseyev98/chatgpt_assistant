@@ -1,4 +1,5 @@
 # admin_bot.py
+import json
 import logging
 import datetime as dt
 from typing import Optional, Tuple, Dict, Any, List
@@ -11,8 +12,21 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-from config import ADMIN_TG_TOKEN, ADMIN_IDS, STAR_USD_RATE
-from db import init_db, conn
+from config import ADMIN_TG_TOKEN, ADMIN_IDS, STAR_USD_RATE, FREE_TAROT_FREE_COUNT
+from db import (
+    init_db,
+    conn,
+    get_tarot_limits_snapshot,
+    get_last_tarot_history,
+    get_support_actions,
+    get_api_errors,
+    adjust_tarot_balance,
+    patch_user_profile_chat,
+    set_user_blocked,
+    is_user_blocked,
+    get_user_by_username,
+    log_support_action,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -84,6 +98,31 @@ def _period_info(period_key: str) -> Tuple[Optional[str], Optional[str], str, st
     return start_s, end_s, label, range_text
 
 
+def _period_days(start_date: Optional[str], end_date: Optional[str], *, cur) -> int:
+    """
+    Возвращает количество дней в периоде.
+    Для all-time (start/end None) берём диапазон по events.created_at.
+    """
+    if start_date and end_date:
+        try:
+            s = dt.datetime.fromisoformat(start_date)
+            e = dt.datetime.fromisoformat(end_date)
+            return max(1, (e - s).days + 1)
+        except Exception:
+            return 1
+
+    cur.execute("SELECT MIN(created_at), MAX(created_at) FROM events")
+    row = cur.fetchone() or (None, None)
+    if not row[0] or not row[1]:
+        return 1
+    try:
+        s = dt.datetime.fromisoformat(row[0])
+        e = dt.datetime.fromisoformat(row[1])
+        return max(1, (e - s).days + 1)
+    except Exception:
+        return 1
+
+
 def _build_source_clause_users(alias: str, source: Optional[str]) -> Tuple[str, List[Any]]:
     """
     Фильтр по users.traffic_source
@@ -142,6 +181,100 @@ def _parse_topic_from_meta(meta: Optional[str]) -> Optional[str]:
     """
     if not meta:
         return None
+
+
+def _fetch_user_row(user_id: int):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, username, first_name, last_name, created_at, last_activity_at, is_blocked
+        FROM users
+        WHERE user_id = ?
+        """,
+        (int(user_id),),
+    )
+    return cur.fetchone()
+
+
+def _format_user_card(user_id: int) -> str:
+    row = _fetch_user_row(user_id)
+    if not row:
+        return "Пользователь не найден."
+
+    uid, username, first_name, last_name, created_at, last_activity_at, is_blocked_flag = row
+    status = "blocked" if int(is_blocked_flag or 0) == 1 else "active"
+
+    snap = get_tarot_limits_snapshot(user_id, user_id)
+    balance = int(snap.get("tarot_free_lifetime_left") or 0) + int(snap.get("tarot_credits") or 0)
+
+    lines = []
+    lines.append("👤 <b>Профиль пользователя</b>")
+    lines.append(f"• user_id: <b>{uid}</b>")
+    lines.append(f"• telegram_user_id: <b>{uid}</b>")
+    lines.append(f"• username: <b>@{username}</b>" if username else "• username: —")
+    name = " ".join([x for x in [first_name, last_name] if x]) or "—"
+    lines.append(f"• имя: <b>{name}</b>")
+    lines.append(f"• дата регистрации: <b>{created_at or '—'}</b>")
+    lines.append(f"• активность: <b>{last_activity_at or '—'}</b>")
+    lines.append(f"• статус: <b>{status}</b>")
+    lines.append(f"• баланс раскладов: <b>{balance}</b> (free={snap.get('tarot_free_lifetime_left')}, credits={snap.get('tarot_credits')})")
+    lines.append("")
+
+    # history: tarot
+    tarot_hist = get_last_tarot_history(user_id, limit=5) or []
+    lines.append("🃏 <b>Последние расклады</b>")
+    if not tarot_hist:
+        lines.append("• нет данных")
+    else:
+        for h in tarot_hist:
+            lines.append(f"• {h.get('created_at')}: {h.get('spread_name') or 'Расклад'}")
+    lines.append("")
+
+    # support actions
+    actions = get_support_actions(user_id, limit=5) or []
+    lines.append("🧾 <b>Баланс: изменения</b>")
+    if not actions:
+        lines.append("• нет данных")
+    else:
+        for a in actions:
+            lines.append(f"• {a.get('created_at')} | {a.get('delta')} | {a.get('reason')}")
+    lines.append("")
+
+    # api errors
+    errs = get_api_errors(user_id, limit=5) or []
+    lines.append("🧯 <b>Ошибки API</b>")
+    if not errs:
+        lines.append("• нет данных")
+    else:
+        for e in errs:
+            lines.append(f"• {e.get('created_at')} | {e.get('endpoint')} | {e.get('status_code')} | {e.get('error_text')}")
+
+    return "\n".join(lines)
+
+
+def _user_action_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("＋1", callback_data=f"user:add:1:{user_id}"),
+                InlineKeyboardButton("＋3", callback_data=f"user:add:3:{user_id}"),
+                InlineKeyboardButton("＋5", callback_data=f"user:add:5:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("－1", callback_data=f"user:sub:1:{user_id}"),
+                InlineKeyboardButton("－3", callback_data=f"user:sub:3:{user_id}"),
+                InlineKeyboardButton("－5", callback_data=f"user:sub:5:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Сбросить сессию", callback_data=f"user:reset:{user_id}"),
+                InlineKeyboardButton("Обновить", callback_data=f"user:refresh:{user_id}"),
+            ],
+            [
+                InlineKeyboardButton("Заблокировать", callback_data=f"user:block:{user_id}"),
+                InlineKeyboardButton("Разблокировать", callback_data=f"user:unblock:{user_id}"),
+            ],
+        ]
+    )
     if "topic:" not in meta:
         return None
     try:
@@ -152,6 +285,29 @@ def _parse_topic_from_meta(meta: Optional[str]) -> Optional[str]:
         return None
 
 
+def _safe_load_json(s: Optional[str], fallback):
+    if not s:
+        return fallback
+    try:
+        return json.loads(s)
+    except Exception:
+        return fallback
+
+
+def _parse_kv_meta(meta: Optional[str]) -> Dict[str, str]:
+    """
+    meta format: "k1:v1;k2:v2"
+    """
+    out: Dict[str, str] = {}
+    if not meta:
+        return out
+    parts = [p for p in meta.split(";") if ":" in p]
+    for p in parts:
+        k, v = p.split(":", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
 # ============================================================
 #  CORE: STATS
 # ============================================================
@@ -159,6 +315,7 @@ def _parse_topic_from_meta(meta: Optional[str]) -> Optional[str]:
 def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, Any]:
     start_date, end_date, period_label, range_text = _period_info(period_key)
     cur = conn.cursor()
+    days_in_period = _period_days(start_date, end_date, cur=cur)
 
     src = source or "all"
 
@@ -169,20 +326,6 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
         u_params,
     )
     total_users_base = cur.fetchone()[0] or 0
-
-    # --- active PRO right now (pro_until > now UTC) ---
-    now_iso = dt.datetime.utcnow().isoformat()
-    cur.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM users u
-        WHERE 1=1 {u_clause}
-          AND u.pro_until IS NOT NULL
-          AND u.pro_until > ?
-        """,
-        u_params + [now_iso],
-    )
-    pro_active_now = cur.fetchone()[0] or 0
 
     # --- follow-up state ---
     # сколько юзеров вообще получили хотя бы 1 follow-up
@@ -247,6 +390,148 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
     voice_cnt = events_by_type.get("voice", 0)
     photo_cnt = events_by_type.get("photo", 0)
     messages_total = text_cnt + voice_cnt + photo_cnt
+    messages_per_day = _safe_div(messages_total, days_in_period)
+
+    # --- tarot readings in period ---
+    cur.execute(
+        f"""
+        SELECT COUNT(*), COUNT(DISTINCT e.user_id)
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'tarot'
+        """,
+        params_events,
+    )
+    row_tarot = cur.fetchone()
+    tarot_cnt = row_tarot[0] or 0
+    tarot_users = row_tarot[1] or 0
+    tarot_per_user = _safe_div(tarot_cnt, tarot_users or 1)
+    tarot_per_active = _safe_div(tarot_cnt, active_users or 1)
+    tarot_per_day = _safe_div(tarot_cnt, days_in_period)
+
+    tarot_cards_sum = 0
+    tarot_cards_n = 0
+    cur.execute(
+        f"""
+        SELECT e.meta
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'tarot'
+        """,
+        params_events,
+    )
+    for (meta,) in cur.fetchall() or []:
+        kv = _parse_kv_meta(meta)
+        if "cards" in kv:
+            try:
+                tarot_cards_sum += int(kv.get("cards") or 0)
+                tarot_cards_n += 1
+            except Exception:
+                pass
+    avg_tarot_cards = _safe_div(tarot_cards_sum, tarot_cards_n or 1)
+
+    # --- paywall shown ---
+    cur.execute(
+        f"""
+        SELECT COUNT(*), COUNT(DISTINCT e.user_id)
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'tarot_paywall'
+        """,
+        params_events,
+    )
+    row_pw = cur.fetchone()
+    paywall_cnt = row_pw[0] or 0
+    paywall_users = row_pw[1] or 0
+
+    # --- purchases (tarot packs) ---
+    cur.execute(
+        f"""
+        SELECT COUNT(*), COUNT(DISTINCT e.user_id)
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'tarot_purchase'
+        """,
+        params_events,
+    )
+    row_buy = cur.fetchone()
+    purchase_cnt = row_buy[0] or 0
+    purchase_users = row_buy[1] or 0
+
+    stars_sum = 0
+    spreads_sum = 0
+    pack_counts: Dict[str, int] = {}
+    cur.execute(
+        f"""
+        SELECT e.meta
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'tarot_purchase'
+        """,
+        params_events,
+    )
+    for (meta,) in cur.fetchall() or []:
+        kv = _parse_kv_meta(meta)
+        try:
+            stars_sum += int(kv.get("stars") or 0)
+            spreads_sum += int(kv.get("spreads") or 0)
+            pack = kv.get("pack") or ""
+            if pack:
+                pack_counts[pack] = pack_counts.get(pack, 0) + 1
+        except Exception:
+            pass
+    avg_purchase_stars = _safe_div(stars_sum, purchase_cnt or 1)
+    purchases_per_user = _safe_div(purchase_cnt, purchase_users or 1)
+    avg_stars_per_payer = _safe_div(stars_sum, purchase_users or 1)
+
+    # --- referrals ---
+    cur.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'ref_start'
+        """,
+        params_events,
+    )
+    ref_start_cnt = cur.fetchone()[0] or 0
+
+    cur.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'ref_reward'
+        """,
+        params_events,
+    )
+    ref_reward_cnt = cur.fetchone()[0] or 0
+
+    cur.execute(
+        f"""
+        SELECT e.meta
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'ref_start'
+        """,
+        params_events,
+    )
+    ref_inviter_counts: Dict[str, int] = {}
+    for (meta,) in cur.fetchall() or []:
+        kv = _parse_kv_meta(meta)
+        inviter = kv.get("inviter") or ""
+        if inviter:
+            ref_inviter_counts[inviter] = ref_inviter_counts.get(inviter, 0) + 1
+    ref_inviters = len(ref_inviter_counts)
+    ref_avg_per_inviter = _safe_div(ref_start_cnt, ref_inviters or 1)
 
     # --- active users in period (sent at least 1 msg) ---
     cur.execute(
@@ -325,58 +610,6 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
     # --- avg messages per active user ---
     avg_msgs_per_user = _safe_div(messages_total, active_users)
 
-    # --- PRO payments in period (filter by pro_payments.traffic_source) ---
-    p_clause, p_params = _build_source_clause_pay("p", src)
-    pd_clause, pd_params = _build_date_clause("p", start_date, end_date)
-    params_pay = p_params + pd_params
-
-    cur.execute(
-        f"""
-        SELECT
-            COUNT(*)                 AS pay_count,
-            COUNT(DISTINCT user_id)  AS pay_users,
-            COALESCE(SUM(stars), 0)  AS total_stars,
-            COALESCE(SUM(days), 0)   AS total_days,
-            COALESCE(AVG(stars), 0)  AS avg_stars
-        FROM pro_payments p
-        WHERE 1=1 {p_clause} {pd_clause}
-        """,
-        params_pay,
-    )
-    row_pay = cur.fetchone()
-    pay_count_period = row_pay[0] or 0
-    pay_users_period = row_pay[1] or 0
-    total_stars_period = row_pay[2] or 0
-    total_days_period = row_pay[3] or 0
-    avg_payment_stars = float(row_pay[4] or 0.0)
-
-    # --- all-time paying users for this source ---
-    cur.execute(
-        f"""
-        SELECT COUNT(DISTINCT user_id)
-        FROM pro_payments p
-        WHERE 1=1 {p_clause}
-        """,
-        p_params,
-    )
-    pay_users_all = cur.fetchone()[0] or 0
-
-    # --- repeat payers all-time for this source ---
-    cur.execute(
-        f"""
-        SELECT COUNT(*)
-        FROM (
-            SELECT user_id
-            FROM pro_payments p
-            WHERE 1=1 {p_clause}
-            GROUP BY user_id
-            HAVING COUNT(*) > 1
-        ) t
-        """,
-        p_params,
-    )
-    repeat_payers_all = cur.fetchone()[0] or 0
-
     # --- TOP topics (from events.meta topic:...) ---
     top_topics: List[Tuple[str, int]] = []
     if start_date and end_date:
@@ -417,19 +650,128 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
     )
     top_limit_topics = [(r[0], r[1]) for r in cur.fetchall() if r and r[0]]
 
+    # --- billing aggregate (credits + free left) ---
+    total_credits = 0
+    total_free_left = 0
+    users_with_credits = 0
+    users_with_free = 0
+    users_with_billing = 0
+    cur.execute(
+        f"""
+        SELECT up.json_profile
+        FROM user_profile up
+        LEFT JOIN users u ON u.user_id = up.user_id
+        WHERE 1=1 {u_clause}
+        """,
+        u_params,
+    )
+    for (json_profile,) in cur.fetchall() or []:
+        prof = _safe_load_json(json_profile, {}) or {}
+        billing = prof.get("billing") or {}
+        credits = int(billing.get("tarot_credits") or 0)
+        free_used = int(billing.get("tarot_free_used") or 0)
+        free_left = max(0, int(FREE_TAROT_FREE_COUNT) - free_used)
+        total_credits += credits
+        total_free_left += free_left
+        if credits > 0:
+            users_with_credits += 1
+        if free_left > 0:
+            users_with_free += 1
+        users_with_billing += 1
+
+    # --- churn funnel by tarot counts (within period) ---
+    cur.execute(
+        f"""
+        SELECT e.user_id, COUNT(*) AS cnt
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type = 'tarot_reading'
+        GROUP BY e.user_id
+        """,
+        params_events,
+    )
+    tarot_counts_by_user: Dict[int, int] = {int(uid): int(cnt) for uid, cnt in cur.fetchall() or []}
+    cur.execute(
+        f"""
+        SELECT DISTINCT e.user_id
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type LIKE 'start:%'
+        """,
+        params_events,
+    )
+    start_users = [int(r[0]) for r in cur.fetchall() or []]
+    start_users_set = set(start_users)
+    start_cnt_users = len(start_users_set) if start_users_set else 0
+
+    tarot0 = 0
+    tarot1 = 0
+    tarot2 = 0
+    tarot3 = 0
+    tarot3plus = 0
+    for uid in start_users_set:
+        c = tarot_counts_by_user.get(uid, 0)
+        if c <= 0:
+            tarot0 += 1
+        elif c == 1:
+            tarot1 += 1
+        elif c == 2:
+            tarot2 += 1
+        elif c == 3:
+            tarot3 += 1
+        else:
+            tarot3plus += 1
+
+    pct_tarot0 = _safe_div(tarot0, start_cnt_users or 1)
+    pct_tarot1 = _safe_div(tarot1, start_cnt_users or 1)
+    pct_tarot2 = _safe_div(tarot2, start_cnt_users or 1)
+    pct_tarot3 = _safe_div(tarot3, start_cnt_users or 1)
+    pct_tarot3plus = _safe_div(tarot3plus, start_cnt_users or 1)
+
+    # among users with >=3 tarot readings in period: referral usage and purchases
+    tarot3_users = {uid for uid, cnt in tarot_counts_by_user.items() if cnt >= 3}
+    if tarot3_users:
+        placeholders = ",".join(["?"] * len(tarot3_users))
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT e.user_id)
+            FROM events e
+            WHERE e.event_type IN ('ref_reward','ref_start')
+              AND e.user_id IN ({placeholders})
+            """,
+            list(tarot3_users),
+        )
+        tarot3_ref_users = cur.fetchone()[0] or 0
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT e.user_id)
+            FROM events e
+            WHERE e.event_type = 'tarot_purchase'
+              AND e.user_id IN ({placeholders})
+            """,
+            list(tarot3_users),
+        )
+        tarot3_buy_users = cur.fetchone()[0] or 0
+    else:
+        tarot3_ref_users = 0
+        tarot3_buy_users = 0
+    pct_tarot3_ref = _safe_div(tarot3_ref_users, len(tarot3_users) or 1)
+    pct_tarot3_buy = _safe_div(tarot3_buy_users, len(tarot3_users) or 1)
+
     # ====================================================
     # CONVERSIONS
     # ====================================================
     base_users = total_users_base if total_users_base > 0 else 1
 
     pct_active_users = _safe_div(active_users, base_users)
-    pct_with_subscription = _safe_div(pay_users_all, base_users)
-    pct_repeat_payers = _safe_div(repeat_payers_all, pay_users_all or 1)
-
     pct_start_to_first_msg = _safe_div(active_users, start_cnt or 1)
-    pct_start_to_pay = _safe_div(pay_users_period, start_cnt or 1)
     pct_first_to_limit = _safe_div(limit_users_cnt, active_users or 1)
-    pct_limit_to_pay = _safe_div(pay_users_period, limit_users_cnt or 1)
+    pct_active_to_tarot = _safe_div(tarot_users, active_users or 1)
+    pct_tarot_to_paywall = _safe_div(paywall_users, tarot_users or 1)
+    pct_paywall_to_purchase = _safe_div(purchase_users, paywall_users or 1)
+    pct_ref_reward = _safe_div(ref_reward_cnt, ref_start_cnt or 1)
 
     pct_text_of_msgs = _safe_div(text_cnt, messages_total or 1)
     pct_voice_of_msgs = _safe_div(voice_cnt, messages_total or 1)
@@ -442,26 +784,41 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
         "source": src,
 
         "total_users_base": total_users_base,
-        "pro_active_now": pro_active_now,
 
         "start_cnt": start_cnt,
         "active_users": active_users,
         "returned_after_ignore": returned_after_ignore,
-
-        "pay_users_all": pay_users_all,
-        "repeat_payers_all": repeat_payers_all,
-
-        "pay_count_period": pay_count_period,
-        "pay_users_period": pay_users_period,
-        "total_stars_period": total_stars_period,
-        "total_days_period": total_days_period,
-        "avg_payment_stars": avg_payment_stars,
 
         "messages_total": messages_total,
         "avg_msgs_per_user": avg_msgs_per_user,
         "text_cnt": text_cnt,
         "voice_cnt": voice_cnt,
         "photo_cnt": photo_cnt,
+        "messages_per_day": messages_per_day,
+
+        "tarot_cnt": tarot_cnt,
+        "tarot_users": tarot_users,
+        "avg_tarot_cards": avg_tarot_cards,
+        "tarot_per_user": tarot_per_user,
+        "tarot_per_active": tarot_per_active,
+        "tarot_per_day": tarot_per_day,
+
+        "paywall_cnt": paywall_cnt,
+        "paywall_users": paywall_users,
+
+        "purchase_cnt": purchase_cnt,
+        "purchase_users": purchase_users,
+        "stars_sum": stars_sum,
+        "spreads_sum": spreads_sum,
+        "avg_purchase_stars": avg_purchase_stars,
+        "purchases_per_user": purchases_per_user,
+        "avg_stars_per_payer": avg_stars_per_payer,
+        "pack_counts": pack_counts,
+
+        "ref_start_cnt": ref_start_cnt,
+        "ref_reward_cnt": ref_reward_cnt,
+        "ref_inviters": ref_inviters,
+        "ref_avg_per_inviter": ref_avg_per_inviter,
 
         "limit_events_cnt": limit_events_cnt,
         "limit_users_cnt": limit_users_cnt,
@@ -472,14 +829,34 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
         "top_topics": top_topics,
         "top_limit_topics": top_limit_topics,
 
+        "total_credits": total_credits,
+        "total_free_left": total_free_left,
+        "users_with_credits": users_with_credits,
+        "users_with_free": users_with_free,
+        "users_with_billing": users_with_billing,
+
+        "start_cnt_users": start_cnt_users,
+        "tarot0": tarot0,
+        "tarot1": tarot1,
+        "tarot2": tarot2,
+        "tarot3": tarot3,
+        "tarot3plus": tarot3plus,
+        "pct_tarot0": pct_tarot0,
+        "pct_tarot1": pct_tarot1,
+        "pct_tarot2": pct_tarot2,
+        "pct_tarot3": pct_tarot3,
+        "pct_tarot3plus": pct_tarot3plus,
+        "pct_tarot3_ref": pct_tarot3_ref,
+        "pct_tarot3_buy": pct_tarot3_buy,
+
         # pct
         "pct_active_users": pct_active_users,
-        "pct_with_subscription": pct_with_subscription,
         "pct_start_to_first_msg": pct_start_to_first_msg,
-        "pct_start_to_pay": pct_start_to_pay,
         "pct_first_to_limit": pct_first_to_limit,
-        "pct_limit_to_pay": pct_limit_to_pay,
-        "pct_repeat_payers": pct_repeat_payers,
+        "pct_active_to_tarot": pct_active_to_tarot,
+        "pct_tarot_to_paywall": pct_tarot_to_paywall,
+        "pct_paywall_to_purchase": pct_paywall_to_purchase,
+        "pct_ref_reward": pct_ref_reward,
         "pct_text_of_msgs": pct_text_of_msgs,
         "pct_voice_of_msgs": pct_voice_of_msgs,
         "pct_photo_of_msgs": pct_photo_of_msgs,
@@ -505,32 +882,45 @@ def _build_stats_keyboard(period_key: str, source: Optional[str]) -> InlineKeybo
 
 
 def _format_stats_text(stats: Dict[str, Any]) -> str:
-    # header
     period_label = stats["period_label"]
     range_text = stats["range_text"]
     source = stats["source"]
 
     total_users_base = stats["total_users_base"]
-    pro_active_now = stats["pro_active_now"]
-
     start_cnt = stats["start_cnt"]
     active_users = stats["active_users"]
     returned_after_ignore = stats["returned_after_ignore"]
-
-    pay_users_all = stats["pay_users_all"]
-    repeat_payers_all = stats["repeat_payers_all"]
-
-    pay_count_period = stats["pay_count_period"]
-    pay_users_period = stats["pay_users_period"]
-    total_stars_period = stats["total_stars_period"]
-    total_days_period = stats["total_days_period"]
-    avg_payment_stars = stats["avg_payment_stars"]
 
     messages_total = stats["messages_total"]
     avg_msgs_per_user = stats["avg_msgs_per_user"]
     text_cnt = stats["text_cnt"]
     voice_cnt = stats["voice_cnt"]
     photo_cnt = stats["photo_cnt"]
+    messages_per_day = stats["messages_per_day"]
+
+    tarot_cnt = stats["tarot_cnt"]
+    tarot_users = stats["tarot_users"]
+    avg_tarot_cards = stats["avg_tarot_cards"]
+    tarot_per_user = stats["tarot_per_user"]
+    tarot_per_active = stats["tarot_per_active"]
+    tarot_per_day = stats["tarot_per_day"]
+
+    paywall_cnt = stats["paywall_cnt"]
+    paywall_users = stats["paywall_users"]
+
+    purchase_cnt = stats["purchase_cnt"]
+    purchase_users = stats["purchase_users"]
+    stars_sum = stats["stars_sum"]
+    spreads_sum = stats["spreads_sum"]
+    avg_purchase_stars = stats["avg_purchase_stars"]
+    purchases_per_user = stats["purchases_per_user"]
+    avg_stars_per_payer = stats["avg_stars_per_payer"]
+    pack_counts = stats.get("pack_counts") or {}
+
+    ref_start_cnt = stats["ref_start_cnt"]
+    ref_reward_cnt = stats["ref_reward_cnt"]
+    ref_inviters = stats["ref_inviters"]
+    ref_avg_per_inviter = stats["ref_avg_per_inviter"]
 
     limit_events_cnt = stats["limit_events_cnt"]
     limit_users_cnt = stats["limit_users_cnt"]
@@ -538,21 +928,40 @@ def _format_stats_text(stats: Dict[str, Any]) -> str:
     users_with_followups = stats["users_with_followups"]
     followups_today = stats["followups_today"]
 
+    total_credits = stats["total_credits"]
+    total_free_left = stats["total_free_left"]
+    users_with_credits = stats["users_with_credits"]
+    users_with_free = stats["users_with_free"]
+    users_with_billing = stats["users_with_billing"]
+
     top_topics = stats.get("top_topics") or []
     top_limit_topics = stats.get("top_limit_topics") or []
 
-    # pct
     pct_active_users = _fmt_pct(stats["pct_active_users"])
-    pct_with_subscription = _fmt_pct(stats["pct_with_subscription"])
     pct_start_to_first_msg = _fmt_pct(stats["pct_start_to_first_msg"])
-    pct_start_to_pay = _fmt_pct(stats["pct_start_to_pay"])
     pct_first_to_limit = _fmt_pct(stats["pct_first_to_limit"])
-    pct_limit_to_pay = _fmt_pct(stats["pct_limit_to_pay"])
-    pct_repeat_payers = _fmt_pct(stats["pct_repeat_payers"])
+    pct_active_to_tarot = _fmt_pct(stats["pct_active_to_tarot"])
+    pct_tarot_to_paywall = _fmt_pct(stats["pct_tarot_to_paywall"])
+    pct_paywall_to_purchase = _fmt_pct(stats["pct_paywall_to_purchase"])
+    pct_ref_reward = _fmt_pct(stats["pct_ref_reward"])
 
     pct_text_of_msgs = _fmt_pct(stats["pct_text_of_msgs"])
     pct_voice_of_msgs = _fmt_pct(stats["pct_voice_of_msgs"])
     pct_photo_of_msgs = _fmt_pct(stats["pct_photo_of_msgs"])
+
+    start_cnt_users = stats["start_cnt_users"]
+    tarot0 = stats["tarot0"]
+    tarot1 = stats["tarot1"]
+    tarot2 = stats["tarot2"]
+    tarot3 = stats["tarot3"]
+    tarot3plus = stats["tarot3plus"]
+    pct_tarot0 = _fmt_pct(stats["pct_tarot0"])
+    pct_tarot1 = _fmt_pct(stats["pct_tarot1"])
+    pct_tarot2 = _fmt_pct(stats["pct_tarot2"])
+    pct_tarot3 = _fmt_pct(stats["pct_tarot3"])
+    pct_tarot3plus = _fmt_pct(stats["pct_tarot3plus"])
+    pct_tarot3_ref = _fmt_pct(stats["pct_tarot3_ref"])
+    pct_tarot3_buy = _fmt_pct(stats["pct_tarot3_buy"])
 
     lines: List[str] = []
     lines.append(f"📊 <b>Статистика — {period_label}</b>")
@@ -562,45 +971,84 @@ def _format_stats_text(stats: Dict[str, Any]) -> str:
 
     lines.append("👥 <b>Пользователи</b>")
     lines.append(f"• Всего в базе: <b>{total_users_base}</b>")
-    lines.append(f"• PRO активны сейчас: <b>{pro_active_now}</b>")
-    lines.append(f"• Стартов за период: <b>{start_cnt}</b>")
+    lines.append(f"• Новые старты за период: <b>{start_cnt}</b>")
     lines.append(f"• Активные (сообщения): <b>{active_users}</b> ({pct_active_users} от базы)")
     lines.append(f"• Вернулись после игнора >2 дней: <b>{returned_after_ignore}</b>")
     lines.append("")
 
-    lines.append("💰 <b>Монетизация</b>")
-    lines.append(f"• Платящих юзеров (всё время): <b>{pay_users_all}</b> ({pct_with_subscription} от базы)")
-    lines.append(f"• Повторные плательщики (всё время): <b>{repeat_payers_all}</b> ({pct_repeat_payers} от платящих)")
-    lines.append(f"• Оплат за период: <b>{pay_count_period}</b>")
-    lines.append(f"• Платящих юзеров за период: <b>{pay_users_period}</b>")
-    lines.append(f"• Получено за период: <b>{_fmt_stars_usd(total_stars_period)}</b>")
-    lines.append(f"• Дней PRO начислено: <b>{total_days_period}</b>")
-    lines.append(f"• Средняя оплата: <b>{avg_payment_stars:.1f}⭐</b>")
-    lines.append("")
-
-    lines.append("✉️ <b>Сообщения</b>")
-    lines.append(f"• Всего сообщений: <b>{messages_total}</b>")
-    lines.append(f"• Среднее на активного: <b>{avg_msgs_per_user:.2f}</b>")
+    lines.append("💬 <b>Сообщения</b>")
+    lines.append(f"• Всего: <b>{messages_total}</b> (в день: {messages_per_day:.1f})")
+    lines.append(f"• Среднее на активного: <b>{avg_msgs_per_user:.1f}</b>")
     lines.append(f"• Текст: <b>{text_cnt}</b> ({pct_text_of_msgs})")
     lines.append(f"• Голос: <b>{voice_cnt}</b> ({pct_voice_of_msgs})")
     lines.append(f"• Фото: <b>{photo_cnt}</b> ({pct_photo_of_msgs})")
     lines.append("")
 
-    lines.append("🚧 <b>Лимиты</b>")
-    lines.append(f"• Событий лимита: <b>{limit_events_cnt}</b>")
-    lines.append(f"• Юзеров упёрлись: <b>{limit_users_cnt}</b>")
+    lines.append("🃏 <b>Таро</b>")
+    lines.append(f"• Раскладов: <b>{tarot_cnt}</b> (в день: {tarot_per_day:.1f})")
+    lines.append(f"• Уникальных пользователей: <b>{tarot_users}</b> ({pct_active_to_tarot} от активных)")
+    lines.append(f"• Среднее число карт: <b>{avg_tarot_cards:.1f}</b>")
+    lines.append(f"• Раскладов на юзера: <b>{tarot_per_user:.2f}</b>")
+    lines.append(f"• Раскладов на активного: <b>{tarot_per_active:.2f}</b>")
+    lines.append(f"• Пейволлов: <b>{paywall_cnt}</b> / юзеров: <b>{paywall_users}</b> ({pct_tarot_to_paywall} от таро)")
     lines.append("")
 
-    lines.append("📨 <b>Follow-up</b>")
-    lines.append(f"• Юзеров, кому слали follow-up хоть раз: <b>{users_with_followups}</b>")
-    lines.append(f"• Follow-up сегодня: <b>{followups_today}</b>")
+    lines.append("💰 <b>Покупки раскладов</b>")
+    lines.append(f"• Покупок: <b>{purchase_cnt}</b> / юзеров: <b>{purchase_users}</b>")
+    lines.append(f"• Куплено раскладов: <b>{spreads_sum}</b>")
+    lines.append(f"• Сумма оплат: <b>{_fmt_stars_usd(stars_sum)}</b>")
+    lines.append(f"• Средний чек: <b>{avg_purchase_stars:.1f}⭐</b>")
+    lines.append(f"• Покупок на юзера: <b>{purchases_per_user:.2f}</b>")
+    lines.append(f"• Средняя оплата на платящего: <b>{avg_stars_per_payer:.1f}⭐</b>")
+    lines.append(f"• Конверсия paywall → покупка: <b>{pct_paywall_to_purchase}</b>")
+    lines.append("")
+
+    if pack_counts:
+        lines.append("📦 <b>Пакеты (частота)</b>")
+        for k, v in sorted(pack_counts.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"• {k} раскладов: {v}")
+        lines.append("")
+
+    lines.append("🎯 <b>Рефералы</b>")
+    lines.append(f"• Переходы по реф. ссылке: <b>{ref_start_cnt}</b>")
+    lines.append(f"• Наград выдано: <b>{ref_reward_cnt}</b> ({pct_ref_reward} от реф. стартов)")
+    lines.append(f"• Пользователей, кто привёл рефералов: <b>{ref_inviters}</b>")
+    lines.append(f"• Среднее рефералов на пригласившего: <b>{ref_avg_per_inviter:.2f}</b>")
+    lines.append("")
+
+    lines.append("💳 <b>Баланс (снимок)</b>")
+    lines.append(f"• Всего кредитов на балансе: <b>{total_credits}</b>")
+    lines.append(f"• Бесплатных раскладов осталось: <b>{total_free_left}</b>")
+    lines.append(f"• Юзеров с кредитами: <b>{users_with_credits}</b>")
+    lines.append(f"• Юзеров с бесплатными: <b>{users_with_free}</b>")
+    lines.append(f"• Юзеров с billing-профилем: <b>{users_with_billing}</b>")
+    lines.append("")
+
+    lines.append("🚦 <b>Ограничения</b>")
+    lines.append(f"• Срабатываний лимитов: <b>{limit_events_cnt}</b>")
+    lines.append(f"• Юзеров, уперлись в лимит: <b>{limit_users_cnt}</b> ({pct_first_to_limit} от активных)")
+    lines.append("")
+
+    lines.append("📨 <b>Рассылки / фоллоуапы</b>")
+    lines.append(f"• Пользователей с follow-up: <b>{users_with_followups}</b>")
+    lines.append(f"• Отправлено сегодня: <b>{followups_today}</b>")
     lines.append("")
 
     lines.append("🧩 <b>Воронка</b>")
     lines.append(f"1️⃣ start → msg: <b>{pct_start_to_first_msg}</b>")
-    lines.append(f"2️⃣ start → pay: <b>{pct_start_to_pay}</b>")
-    lines.append(f"3️⃣ msg → limit: <b>{pct_first_to_limit}</b>")
-    lines.append(f"4️⃣ limit → pay: <b>{pct_limit_to_pay}</b>")
+    lines.append(f"2️⃣ msg → limit: <b>{pct_first_to_limit}</b>")
+    lines.append(f"3️⃣ msg → tarot: <b>{pct_active_to_tarot}</b>")
+    lines.append(f"4️⃣ tarot → paywall: <b>{pct_tarot_to_paywall}</b>")
+    lines.append(f"5️⃣ paywall → purchase: <b>{pct_paywall_to_purchase}</b>")
+    lines.append("")
+
+    lines.append("🧮 <b>Отвалы по раскладам (среди стартов периода)</b>")
+    lines.append(f"• 0 раскладов: <b>{tarot0}</b> ({pct_tarot0})")
+    lines.append(f"• 1 расклад: <b>{tarot1}</b> ({pct_tarot1})")
+    lines.append(f"• 2 расклада: <b>{tarot2}</b> ({pct_tarot2})")
+    lines.append(f"• 3 расклада: <b>{tarot3}</b> ({pct_tarot3})")
+    lines.append(f"• 4+ расклада: <b>{tarot3plus}</b> ({pct_tarot3plus})")
+    lines.append(f"• Из 3+ раскладов: рефералы <b>{pct_tarot3_ref}</b>, покупки <b>{pct_tarot3_buy}</b>")
     lines.append("")
 
     if top_topics:
@@ -627,12 +1075,19 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (
-        "👋 <b>Админ-панель Foxy</b>\n\n"
+        "👋 <b>Админ-панель Astra</b>\n\n"
         "Команды:\n"
         "• /stats — статистика (кнопки периодов)\n"
         "• /offers — список источников (/start?src=...)\n"
+        "• /user <id|@username> — профиль пользователя\n"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Статистика (сегодня)", callback_data="stats:today:all")],
+            [InlineKeyboardButton("Источники", callback_data="offer_stats:all:today")],
+        ]
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,6 +1134,111 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
     await query.answer()
+
+
+async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /user <id|@username>")
+        return
+
+    query = args[0].strip()
+    user_id = None
+    if query.isdigit():
+        user_id = int(query)
+    elif query.startswith("@"):
+        row = get_user_by_username(query)
+        user_id = int(row[0]) if row else None
+    else:
+        row = get_user_by_username(query)
+        user_id = int(row[0]) if row else None
+
+    if not user_id:
+        await update.message.reply_text("Пользователь не найден.")
+        return
+
+    text = _format_user_card(user_id)
+    keyboard = _user_action_keyboard(user_id)
+    await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def user_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    if not _is_admin(query.from_user.id):
+        await query.answer("Команда только для админов", show_alert=True)
+        return
+
+    try:
+        _, action, value, user_id_raw = query.data.split(":", maxsplit=3)
+    except Exception:
+        await query.answer("Некорректные данные", show_alert=True)
+        return
+
+    try:
+        user_id = int(user_id_raw)
+    except Exception:
+        await query.answer("Некорректный user_id", show_alert=True)
+        return
+
+    admin_id = query.from_user.id
+    if action in {"add", "sub"}:
+        try:
+            delta = int(value)
+            if action == "sub":
+                delta = -abs(delta)
+            else:
+                delta = abs(delta)
+            adjust_tarot_balance(user_id, user_id, delta)
+            log_support_action(user_id, admin_id=admin_id, delta=delta, reason=f"admin_{action}_{abs(int(value))}")
+            await query.answer("Баланс обновлён", show_alert=False)
+        except Exception as e:
+            logger.exception("Failed to adjust balance: %s", e)
+            await query.answer("Ошибка изменения баланса", show_alert=True)
+    elif action == "reset":
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT chat_id FROM user_profile WHERE user_id = ?", (user_id,))
+            rows = cur.fetchall() or []
+            for (chat_id,) in rows:
+                patch_user_profile_chat(
+                    user_id,
+                    int(chat_id),
+                    patch={},
+                    delete_keys=["pending_tarot", "pre_dialog"],
+                )
+            await query.answer("Сессия сброшена", show_alert=False)
+        except Exception as e:
+            logger.exception("Failed to reset session: %s", e)
+            await query.answer("Ошибка сброса сессии", show_alert=True)
+    elif action == "block":
+        try:
+            set_user_blocked(user_id, True)
+            await query.answer("Пользователь заблокирован", show_alert=False)
+        except Exception:
+            await query.answer("Ошибка блокировки", show_alert=True)
+    elif action == "unblock":
+        try:
+            set_user_blocked(user_id, False)
+            await query.answer("Пользователь разблокирован", show_alert=False)
+        except Exception:
+            await query.answer("Ошибка разблокировки", show_alert=True)
+    elif action == "refresh":
+        await query.answer()
+    else:
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
+
+    # refresh card
+    text = _format_user_card(user_id)
+    keyboard = _user_action_keyboard(user_id)
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        pass
 
 
 async def offers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -771,9 +1331,11 @@ def main():
     app.add_handler(CommandHandler("start", admin_start))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("offers", offers_command))
+    app.add_handler(CommandHandler("user", user_command))
 
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats:"))
     app.add_handler(CallbackQueryHandler(offer_stats_callback, pattern=r"^offer_stats:"))
+    app.add_handler(CallbackQueryHandler(user_action_callback, pattern=r"^user:"))
 
     logger.info("Admin bot started")
     app.run_polling()
