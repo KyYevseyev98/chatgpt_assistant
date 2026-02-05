@@ -1,4 +1,5 @@
 # admin_bot.py
+import html
 import json
 import logging
 import datetime as dt
@@ -10,6 +11,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
 )
 
 from config import ADMIN_TG_TOKEN, ADMIN_IDS, STAR_USD_RATE, FREE_TAROT_FREE_COUNT
@@ -175,6 +178,10 @@ def _fmt_stars_usd(stars: int) -> str:
     return f"{stars}⭐ (~${usd:.2f})"
 
 
+def _h(text: Optional[str]) -> str:
+    return html.escape(str(text)) if text is not None else ""
+
+
 def _parse_topic_from_meta(meta: Optional[str]) -> Optional[str]:
     """
     meta пример: "topic:nutrition;batch_size:2"
@@ -211,12 +218,12 @@ def _format_user_card(user_id: int) -> str:
     lines.append("👤 <b>Профиль пользователя</b>")
     lines.append(f"• user_id: <b>{uid}</b>")
     lines.append(f"• telegram_user_id: <b>{uid}</b>")
-    lines.append(f"• username: <b>@{username}</b>" if username else "• username: —")
+    lines.append(f"• username: <b>@{_h(username)}</b>" if username else "• username: —")
     name = " ".join([x for x in [first_name, last_name] if x]) or "—"
-    lines.append(f"• имя: <b>{name}</b>")
-    lines.append(f"• дата регистрации: <b>{created_at or '—'}</b>")
-    lines.append(f"• активность: <b>{last_activity_at or '—'}</b>")
-    lines.append(f"• статус: <b>{status}</b>")
+    lines.append(f"• имя: <b>{_h(name)}</b>")
+    lines.append(f"• дата регистрации: <b>{_h(created_at or '—')}</b>")
+    lines.append(f"• активность: <b>{_h(last_activity_at or '—')}</b>")
+    lines.append(f"• статус: <b>{_h(status)}</b>")
     lines.append(f"• баланс раскладов: <b>{balance}</b> (free={snap.get('tarot_free_lifetime_left')}, credits={snap.get('tarot_credits')})")
     lines.append("")
 
@@ -227,7 +234,7 @@ def _format_user_card(user_id: int) -> str:
         lines.append("• нет данных")
     else:
         for h in tarot_hist:
-            lines.append(f"• {h.get('created_at')}: {h.get('spread_name') or 'Расклад'}")
+            lines.append(f"• {_h(h.get('created_at'))}: {_h(h.get('spread_name') or 'Расклад')}")
     lines.append("")
 
     # support actions
@@ -237,7 +244,7 @@ def _format_user_card(user_id: int) -> str:
         lines.append("• нет данных")
     else:
         for a in actions:
-            lines.append(f"• {a.get('created_at')} | {a.get('delta')} | {a.get('reason')}")
+            lines.append(f"• {_h(a.get('created_at'))} | {a.get('delta')} | {_h(a.get('reason'))}")
     lines.append("")
 
     # api errors
@@ -247,7 +254,7 @@ def _format_user_card(user_id: int) -> str:
         lines.append("• нет данных")
     else:
         for e in errs:
-            lines.append(f"• {e.get('created_at')} | {e.get('endpoint')} | {e.get('status_code')} | {e.get('error_text')}")
+            lines.append(f"• {_h(e.get('created_at'))} | {_h(e.get('endpoint'))} | {e.get('status_code')} | {_h(e.get('error_text'))}")
 
     return "\n".join(lines)
 
@@ -392,6 +399,19 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
     messages_total = text_cnt + voice_cnt + photo_cnt
     messages_per_day = _safe_div(messages_total, days_in_period)
 
+    # --- active users in period (sent at least 1 msg) ---
+    cur.execute(
+        f"""
+        SELECT COUNT(DISTINCT e.user_id)
+        FROM events e
+        LEFT JOIN users u ON u.user_id = e.user_id
+        WHERE 1=1 {eu_clause} {e_clause}
+          AND e.event_type IN ('text','voice','photo')
+        """,
+        params_events,
+    )
+    active_users = cur.fetchone()[0] or 0
+
     # --- tarot readings in period ---
     cur.execute(
         f"""
@@ -532,19 +552,6 @@ def _compute_stats(period_key: str, source: Optional[str] = None) -> Dict[str, A
             ref_inviter_counts[inviter] = ref_inviter_counts.get(inviter, 0) + 1
     ref_inviters = len(ref_inviter_counts)
     ref_avg_per_inviter = _safe_div(ref_start_cnt, ref_inviters or 1)
-
-    # --- active users in period (sent at least 1 msg) ---
-    cur.execute(
-        f"""
-        SELECT COUNT(DISTINCT e.user_id)
-        FROM events e
-        LEFT JOIN users u ON u.user_id = e.user_id
-        WHERE 1=1 {eu_clause} {e_clause}
-          AND e.event_type IN ('text','voice','photo')
-        """,
-        params_events,
-    )
-    active_users = cur.fetchone()[0] or 0
 
     # --- limit events in period (text/photo/voice limit) ---
     cur.execute(
@@ -966,7 +973,7 @@ def _format_stats_text(stats: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append(f"📊 <b>Статистика — {period_label}</b>")
     lines.append(f"🗓 Период: {range_text}")
-    lines.append(f"🔗 Источник: <b>{_source_label(source)}</b>")
+    lines.append(f"🔗 Источник: <b>{_h(_source_label(source))}</b>")
     lines.append("")
 
     lines.append("👥 <b>Пользователи</b>")
@@ -1054,13 +1061,13 @@ def _format_stats_text(stats: Dict[str, Any]) -> str:
     if top_topics:
         lines.append("🔥 <b>Топ тем (по text.meta)</b>")
         for t, c in top_topics:
-            lines.append(f"• {t}: {c}")
+            lines.append(f"• {_h(t)}: {c}")
         lines.append("")
 
     if top_limit_topics:
         lines.append("⛔ <b>Топ тем, где упираются в лимит (last_limit_topic)</b>")
         for t, c in top_limit_topics:
-            lines.append(f"• {t}: {c}")
+            lines.append(f"• {_h(t)}: {c}")
         lines.append("")
 
     return "\n".join(lines)
@@ -1079,7 +1086,7 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "• /stats — статистика (кнопки периодов)\n"
         "• /offers — список источников (/start?src=...)\n"
-        "• /user <id|@username> — профиль пользователя\n"
+        "• /user &lt;id|@username&gt; — профиль пользователя\n"
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -1162,6 +1169,40 @@ async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = _format_user_card(user_id)
     keyboard = _user_action_keyboard(user_id)
     await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def forwarded_user_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update):
+        return
+    msg = update.effective_message
+    if not msg:
+        return
+
+    fwd_from = getattr(msg, "forward_from", None)
+    fwd_origin = getattr(msg, "forward_origin", None)
+    user_id = None
+    username = None
+
+    if fwd_from:
+        user_id = getattr(fwd_from, "id", None)
+        username = getattr(fwd_from, "username", None)
+    elif fwd_origin and getattr(fwd_origin, "type", "") == "user":
+        user = getattr(fwd_origin, "sender_user", None)
+        if user:
+            user_id = getattr(user, "id", None)
+            username = getattr(user, "username", None)
+
+    if not user_id and username:
+        row = get_user_by_username(username)
+        user_id = int(row[0]) if row else None
+
+    if not user_id:
+        await msg.reply_text("Не удалось определить пользователя из пересланного сообщения.")
+        return
+
+    text = _format_user_card(int(user_id))
+    keyboard = _user_action_keyboard(int(user_id))
+    await msg.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def user_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1270,7 +1311,7 @@ async def offers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard_rows: List[List[InlineKeyboardButton]] = []
 
     for src, users_cnt in rows:
-        lines.append(f"• <b>{src}</b>: {users_cnt}")
+        lines.append(f"• <b>{_h(src)}</b>: {users_cnt}")
         keyboard_rows.append(
             [InlineKeyboardButton(f"{src} ({users_cnt})", callback_data=f"offer_stats:{src}:today")]
         )
@@ -1336,6 +1377,7 @@ def main():
     app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats:"))
     app.add_handler(CallbackQueryHandler(offer_stats_callback, pattern=r"^offer_stats:"))
     app.add_handler(CallbackQueryHandler(user_action_callback, pattern=r"^user:"))
+    app.add_handler(MessageHandler(filters.FORWARDED, forwarded_user_lookup))
 
     logger.info("Admin bot started")
     app.run_polling()

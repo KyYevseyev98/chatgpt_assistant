@@ -16,7 +16,7 @@ from config import (
     MAX_TAROT_HISTORY_PER_USER,
 )
 
-from .connection import conn, cur, MAX_EVENTS_ROWS
+from .connection import conn, cur, MAX_EVENTS_ROWS, connect_ctx
 from .memory import get_user_memory_snapshot
 from .profiles import get_user_profile_snapshot
 from .tarot_limits import get_tarot_limits_snapshot
@@ -54,7 +54,7 @@ def prune_messages(user_id: int, chat_id: int, keep: int = None) -> None:
     if keep is None:
         keep = int(MAX_DB_MESSAGES_PER_CHAT or 200)
     keep = max(50, int(keep))
-    with _connect() as conn:
+    with connect_ctx() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -86,7 +86,7 @@ def add_tarot_history(
     meta_json = json.dumps(cards_meta or [], ensure_ascii=False)
     excerpt = (answer_excerpt or "")[:1200]
 
-    with _connect() as conn:
+    with connect_ctx() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -104,7 +104,7 @@ def prune_tarot_history(user_id: int, keep: int = None) -> None:
     if keep is None:
         keep = int(MAX_TAROT_HISTORY_PER_USER or 100)
     keep = max(10, int(keep))
-    with _connect() as conn:
+    with connect_ctx() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -127,7 +127,7 @@ def get_last_tarot_history(user_id: int, chat_id: int = None, limit: int = None)
     if limit is None:
         limit = int(MAX_TAROT_HISTORY_PER_USER or 100)
     limit = max(1, int(limit))
-    with _connect() as conn:
+    with connect_ctx() as conn:
         cur = conn.cursor()
         if chat_id is None:
             cur.execute(
