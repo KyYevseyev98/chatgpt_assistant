@@ -338,10 +338,74 @@ def _has_explicit_tarot_trigger(text: str) -> bool:
     t = _normalize_for_intent(text)
     if not t:
         return False
+    # явный отказ от расклада — не считаем триггером
+    if _exit_tarot_mode_requested(t):
+        return False
+    if t.startswith("не ") or " не " in t:
+        return False
     # быстрый отсев бытовых коротышей
     if len(t) < 3:
         return False
     return any(k in t for k in TAROT_TRIGGERS_NORM)
+
+
+def _extract_requested_cards(text: str) -> Optional[int]:
+    """Extract requested number of cards from user text (1..7)."""
+    t = _normalize_for_intent(text)
+    if not t:
+        return None
+
+    # ranges like "1-2", "1–2", "1/2"
+    m = re.search(r"\b([1-7])\s*[-/–]\s*([1-7])\b", t)
+    if m:
+        a = int(m.group(1))
+        b = int(m.group(2))
+        return max(a, b)
+
+    # explicit digits
+    m = re.search(r"\b([1-7])\b", t)
+    if m:
+        return int(m.group(1))
+
+    # word forms
+    word_map = {
+        "одна": 1, "одной": 1, "один": 1, "перв": 1,
+        "две": 2, "двух": 2, "втор": 2, "пара": 2,
+        "три": 3, "трех": 3,
+        "четыре": 4, "четырех": 4,
+        "пять": 5, "пяти": 5,
+        "шесть": 6, "шести": 6,
+        "семь": 7, "семи": 7,
+    }
+    for w, n in word_map.items():
+        if re.search(rf"\b{w}\b", t):
+            return n
+
+    return None
+
+
+def _is_yes_no_question(text: str) -> bool:
+    t = _normalize_for_intent(text)
+    if not t:
+        return False
+    return any(k in t for k in ("да или нет", "да/нет", "да нет", "ответ да или нет", "да?", "нет?")) or t.endswith("?")
+
+
+def _infer_cards_count(text: str, *, has_context: bool) -> int:
+    """Heuristic for cards count: 1-3 for simple, 5-7 for complex."""
+    t = _normalize_for_intent(text)
+    if not t:
+        return 3
+    if _is_yes_no_question(t):
+        return 1
+    length = len((text or "").strip())
+    tokens = len(t.split())
+    complex_markers = ("почему", "что делать", "как быть", "перспектива", "разбор", "глубже", "сложно", "комплекс")
+    if any(k in t for k in complex_markers) and (tokens >= 12 or has_context):
+        return 5
+    if tokens <= 8 and length <= 70:
+        return 2
+    return 3
 
 
 def _looks_like_tech_question(text: str) -> bool:
@@ -391,6 +455,11 @@ def _exit_tarot_mode_requested(text: str) -> bool:
         "не надо расклад",
         "не нужно расклад",
         "не надо карты",
+        "не делай расклад",
+        "не делай таро",
+        "не хочу расклад",
+        "не хочу таро",
+        "не гадай",
     )
     return any(_normalize_for_intent(p) in t for p in exit_phrases)
 
@@ -417,6 +486,10 @@ def _looks_like_tarot_invite(text: str) -> bool:
 def _is_confirmation_text(text: str) -> bool:
     t = _normalize_for_intent(text)
     if not t:
+        return False
+    if _exit_tarot_mode_requested(t):
+        return False
+    if t.startswith("не ") or " не " in t:
         return False
     confirmations = (
         "да", "давай", "ок", "okay", "хочу", "поехали", "сделай", "делай", "конечно",
@@ -547,7 +620,9 @@ def _has_enough_context(text: str) -> bool:
     t = _normalize_for_intent(text)
     if not t:
         return False
-    if len(t.split()) >= 25:
+    if len(t.split()) >= 12:
+        return True
+    if len((text or "").strip()) >= 80:
         return True
     if (text or "").count(".") + (text or "").count("!") + (text or "").count("?") >= 2:
         return True
@@ -556,7 +631,7 @@ def _has_enough_context(text: str) -> bool:
 
 def _extract_theme(text: str) -> str:
     t = _normalize_for_intent(text)
-    if any(k in t for k in ("отношен", "любов", "чувств", "бывш", "пара")):
+    if any(k in t for k in ("отношен", "любов", "чувств", "бывш", "пара", "парень", "девуш", "нрав", "свидан", "кофе", "влюб")):
         return "отношения"
     if any(k in t for k in ("деньг", "работ", "карьер", "бизнес", "доход", "финанс")):
         return "финансы/работа"
@@ -596,14 +671,25 @@ def _next_pre_dialog_question(state: Dict[str, Any], user_text: str) -> str:
         return "Хочу понять тебя точнее, чтобы расклад был честным и полезным. О чём это в целом: отношения, работа/деньги, выбор, состояние — или другое?"
     if not horizon:
         return "На какой горизонт хочешь посмотреть: сегодня, ближайшие дни, неделя/месяц, 3 месяца, год?"
-    return "Что происходит сейчас и чего ты хочешь понять? Можно 2–5 предложений — этого достаточно."
+    if theme == "отношения" and not state.get("context"):
+        return "О ком именно речь и что между вами происходит сейчас? (кто этот человек, как вы связаны, что случилось)"
+    if not state.get("context"):
+        return "Что происходит сейчас в этой ситуации? Можно 2–5 предложений — этого достаточно."
+    if not state.get("goal"):
+        return "Что именно хочешь понять в итоге? (например: чувства, перспектива, что делать дальше)"
+    return "Сформулируй один конкретный вопрос, на который хочешь получить ответ через карты."
 
 
 def _update_pre_dialog_state(state: Dict[str, Any], user_text: str) -> Dict[str, Any]:
     theme = state.get("theme") or _extract_theme(user_text)
     horizon = state.get("horizon") or _extract_horizon(user_text)
     context = state.get("context") or (user_text if _has_enough_context(user_text) else "")
-    goal = state.get("goal") or (user_text if _has_enough_context(user_text) else "")
+    goal = state.get("goal") or (
+        user_text
+        if any(k in _normalize_for_intent(user_text) for k in ("хочу", "нужно", "понять", "узнать", "что делать", "как быть"))
+        else ""
+    )
+    requested_cards = state.get("requested_cards") or _extract_requested_cards(user_text)
 
     questions = int(state.get("questions", 0) or 0) + 1
     return {
@@ -612,6 +698,7 @@ def _update_pre_dialog_state(state: Dict[str, Any], user_text: str) -> Dict[str,
         "context": context,
         "goal": goal,
         "questions": questions,
+        "requested_cards": requested_cards,
         "expires_at": time.time() + float(PRE_DIALOG_TTL_SEC),
     }
 
@@ -1729,18 +1816,40 @@ async def _handle_tarot_routing(
     if _is_pre_dialog_expired(pre_state):
         _clear_pre_dialog_state(user_id, msg.chat_id)
         pre_state = {}
+
+    # if user explicitly asked for tarot but context is weak, start pre-dialog immediately
+    trigger_text = _choose_trigger_text(clean_text, extracted)
+    explicit_trigger = _has_explicit_tarot_trigger(trigger_text)
+    if explicit_trigger and not _is_pre_dialog_active(pre_state) and not _has_enough_context(clean_text or extracted):
+        initial = {
+            "theme": _extract_theme(clean_text or extracted),
+            "horizon": _extract_horizon(clean_text or extracted),
+            "context": "",
+            "goal": "",
+            "questions": 1,
+            "consent": True,
+            "requested_cards": _extract_requested_cards(trigger_text),
+            "expires_at": time.time() + float(PRE_DIALOG_TTL_SEC),
+        }
+        _set_pre_dialog_state(user_id, msg.chat_id, initial)
+        reflect = _build_reflective_prompt(clean_text or extracted)
+        question = _next_pre_dialog_question(initial, clean_text or extracted)
+        await send_smart_answer(msg, f"{reflect}\n\n{question}")
+        return True
     if _is_pre_dialog_active(pre_state):
-        # update state with latest user text
-        updated = _update_pre_dialog_state(pre_state, clean_text or extracted)
+        # update state with latest user text (без reply/forward контекста)
+        user_answer = clean_text if clean_text else extracted
+        updated = _update_pre_dialog_state(pre_state, user_answer)
         _set_pre_dialog_state(user_id, msg.chat_id, updated)
 
-        if _pre_dialog_is_ready(updated) or int(updated.get("questions", 0)) >= int(PRE_DIALOG_MAX_QUESTIONS):
+        if _pre_dialog_is_ready(updated):
             # explicit consent handling
-            if updated.get("consent") or _has_tarot_consent(clean_text or extracted):
+            if updated.get("consent") or _has_tarot_consent(user_answer):
                 summary = _build_pre_dialog_summary(updated)
+                req_cards = int(updated.get("requested_cards") or 0)
                 route = RouteResult(
                     action="reading",
-                    cards=0,
+                    cards=req_cards if 1 <= req_cards <= 7 else 0,
                     spread_name="Расклад",
                     clarify_question="",
                     reason="pre_dialog_consent",
@@ -1758,9 +1867,30 @@ async def _handle_tarot_routing(
             )
             return True
 
-        # ask next gentle question
-        reflect = _build_reflective_prompt(clean_text or extracted)
-        question = _next_pre_dialog_question(updated, clean_text or extracted)
+        if int(updated.get("questions", 0)) >= int(PRE_DIALOG_MAX_QUESTIONS):
+            # достигли лимита вопросов, но данных всё ещё не хватает — уточняем конкретно
+            reflect = _build_reflective_prompt(user_answer)
+            question = _next_pre_dialog_question(updated, user_answer)
+            await send_smart_answer(msg, f"{reflect}\n\n{question}")
+            return True
+
+        # ask next gentle question (avoid repeating the same prompt)
+        reflect = _build_reflective_prompt(user_answer)
+        question = _next_pre_dialog_question(updated, user_answer)
+        last_q = str(updated.get("last_question") or "")
+        repeat_count = int(updated.get("repeat_count") or 0)
+        if question == last_q:
+            repeat_count += 1
+        else:
+            repeat_count = 0
+        if repeat_count >= 1:
+            question = (
+                "Давай чуть проще: это про отношения, работу/деньги, выбор или состояние? "
+                "Можно коротко — одно слово."
+            )
+        updated["last_question"] = question
+        updated["repeat_count"] = repeat_count
+        _set_pre_dialog_state(user_id, msg.chat_id, updated)
         await send_smart_answer(msg, f"{reflect}\n\n{question}")
         return True
 
@@ -1807,7 +1937,26 @@ async def _handle_tarot_routing(
         if explicit_trigger and getattr(route, "action", "") == "chat":
             route = _route_override_from_trigger(trigger_text, mode=mode)
             logger.warning("TAROT ROUTE OVERRIDE -> %s (explicit=%s)", route, explicit_trigger)
-        # В session-mode не форсим расклад без явного запроса.
+        # override cards if user requested 1-2 etc.
+        req_cards = _extract_requested_cards(trigger_text)
+        if req_cards and getattr(route, "action", "") == "reading":
+            route = RouteResult(
+                action="reading",
+                cards=int(req_cards),
+                spread_name=getattr(route, "spread_name", "") or "Расклад",
+                clarify_question=getattr(route, "clarify_question", ""),
+                reason="override_requested_cards",
+            )
+        if getattr(route, "action", "") == "reading" and not req_cards:
+            # fallback heuristic: keep 1-3 for simple, 5 for complex
+            inferred = _infer_cards_count(trigger_text, has_context=_has_enough_context(clean_text or extracted))
+            route = RouteResult(
+                action="reading",
+                cards=int(inferred),
+                spread_name=getattr(route, "spread_name", "") or "Расклад",
+                clarify_question=getattr(route, "clarify_question", ""),
+                reason="override_infer_cards",
+            )
     except Exception:
         _log_exception("suppressed exception")
 
@@ -1838,7 +1987,7 @@ async def _handle_tarot_routing(
     if route.action == "reading":
         trigger_text = _choose_trigger_text(clean_text, extracted)
         explicit = _has_explicit_tarot_trigger(trigger_text)
-        allow_tarot = explicit or session_active
+        allow_tarot = explicit
 
         if not allow_tarot:
             # безопасный фолбэк: обычный чат
@@ -1854,6 +2003,7 @@ async def _handle_tarot_routing(
                 "goal": "",
                 "questions": 1,
                 "consent": True,
+                "requested_cards": _extract_requested_cards(clean_text or extracted),
                 "expires_at": time.time() + float(PRE_DIALOG_TTL_SEC),
             }
             _set_pre_dialog_state(user_id, msg.chat_id, initial)
