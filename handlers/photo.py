@@ -10,6 +10,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from config import MAX_HISTORY_MESSAGES, UNLIMITED_USERNAMES
+from admin_forum import mirror_user_message
 from db import (
     check_limit,
     log_event,
@@ -33,7 +34,7 @@ from localization import (
 )
 from gpt_client import ask_gpt_with_image, generate_limit_paywall_text, generate_limit_paywall_text_via_chat
 from long_memory import build_long_memory_block, maybe_update_long_memory
-from .common import send_smart_answer, send_typing_action, get_media_lock, trim_history_for_model
+from .common import send_smart_answer, reply_and_mirror, send_typing_action, get_media_lock, trim_history_for_model, build_profile_system_block
 from .pro import _pro_keyboard
 from .topics import get_current_topic
 
@@ -95,7 +96,7 @@ async def _send_tarot_paywall(
     except Exception:
         _log_exception("paywall log_event failed")
 
-    await msg.reply_text(paywall.strip(), reply_markup=_pro_keyboard(lang))
+    await reply_and_mirror(msg, paywall.strip(), reply_markup=_pro_keyboard(lang))
     try:
         from handlers.text import _safe_patch_user_profile_chat, _set_tarot_session_mode
         _safe_patch_user_profile_chat(user_id, msg.chat_id, delete_keys=["pending_tarot", "pre_dialog"])
@@ -258,7 +259,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _log_exception("update_user_identity failed")
 
     if is_user_blocked(user_id):
-        await msg.reply_text("Доступ ограничен. Напишите в поддержку.")
+        await reply_and_mirror(msg, "Доступ ограничен. Напишите в поддержку.")
         return
 
     # защита от альбома (для PHOTO)
@@ -270,7 +271,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled_groups.add(media_group_id)
         context.chat_data["handled_media_groups"] = handled_groups
 
-        await msg.reply_text(multi_photo_not_allowed(lang))
+        await reply_and_mirror(msg, multi_photo_not_allowed(lang))
         _safe_log_event(user_id, "multi_photo_not_allowed")
         return
 
@@ -290,6 +291,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not clean_text:
         clean_text = (parts.get("forwarded") or "").strip() or (parts.get("reply_to") or "").strip()
     extracted = (data.get("clean_text") or "").strip()
+
+    try:
+        await mirror_user_message(context.bot, msg, extracted or user_question)
+    except Exception:
+        _log_exception("admin_forum mirror user failed")
 
     # unified tarot routing (shared across text/voice/photo)
     # глобальный стоп: если расклады закончились, отвечаем paywall на любое сообщение
@@ -368,7 +374,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         final_text = paywall.strip()
 
-        await msg.reply_text(
+        await reply_and_mirror(
             final_text,
             reply_markup=_pro_keyboard(lang),
         )
@@ -395,7 +401,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_bytes = bytes(bio)
             except Exception as e:
                 logger.exception("Ошибка при скачивании фото: %s", e)
-                await msg.reply_text(photo_placeholder_text(lang))
+                await reply_and_mirror(msg, photo_placeholder_text(lang))
                 _safe_log_event(user_id, "photo_download_error", meta=str(e))
                 return
 
@@ -413,6 +419,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             memory_block = build_long_memory_block(user_id, msg.chat_id, lang=lang)
             if memory_block:
                 history_for_model = [{"role": "system", "content": memory_block}] + history_for_model
+            try:
+                prof = get_user_profile_chat(user_id, msg.chat_id) or {}
+                prof_block = build_profile_system_block(prof)
+                if prof_block:
+                    history_for_model = [prof_block] + history_for_model
+            except Exception:
+                _log_exception("profile block failed")
 
             try:
                 answer = await ask_gpt_with_image(

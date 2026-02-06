@@ -89,6 +89,41 @@ def set_last_followup_meta(
     conn.commit()
 
 
+def set_last_followup_context(
+    user_id: int,
+    *,
+    question: Optional[str] = None,
+    context: Optional[str] = None,
+) -> None:
+    """
+    Store a short snapshot for the followup invite:
+    question/context will be saved into existing user columns.
+    """
+    get_user(user_id)
+    q = (question or "").strip()[:600] if question else None
+    ctx = (context or "").strip()[:900] if context else None
+    cur.execute(
+        """
+        UPDATE users
+        SET last_user_message = COALESCE(?, last_user_message),
+            last_bot_message = COALESCE(?, last_bot_message)
+        WHERE user_id = ?
+        """,
+        (q, ctx, user_id),
+    )
+    conn.commit()
+
+
+def touch_last_followup_at(user_id: int) -> None:
+    get_user(user_id)
+    now_iso = dt.datetime.utcnow().isoformat()
+    cur.execute(
+        "UPDATE users SET last_followup_at = ? WHERE user_id = ?",
+        (now_iso, user_id),
+    )
+    conn.commit()
+
+
 def set_last_limit_info(user_id: int, *, topic: Optional[str], limit_type: str) -> None:
     get_user(user_id)
     t = (topic or "").strip()[:64] if topic else None

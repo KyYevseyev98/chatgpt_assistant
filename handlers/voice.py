@@ -29,7 +29,8 @@ from db import (
     update_user_identity,
     is_user_blocked,
 )
-from .common import send_smart_answer, send_typing_action, get_media_lock, trim_history_for_model
+from .common import send_smart_answer, reply_and_mirror, send_typing_action, get_media_lock, trim_history_for_model, build_profile_system_block
+from admin_forum import mirror_user_message
 from .pro import _pro_keyboard
 from .topics import get_current_topic
 from long_memory import build_long_memory_block, maybe_update_long_memory
@@ -95,7 +96,7 @@ async def _send_tarot_paywall(
     except Exception:
         _log_exception("paywall log_event failed")
 
-    await msg.reply_text(paywall.strip(), reply_markup=_pro_keyboard(lang))
+    await reply_and_mirror(msg, paywall.strip(), reply_markup=_pro_keyboard(lang))
     try:
         from handlers.text import _safe_patch_user_profile_chat, _set_tarot_session_mode
         _safe_patch_user_profile_chat(user_id, msg.chat_id, delete_keys=["pending_tarot", "pre_dialog"])
@@ -233,7 +234,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _log_exception("update_user_identity failed")
 
     if is_user_blocked(user_id):
-        await msg.reply_text("Доступ ограничен. Напишите в поддержку.")
+        await reply_and_mirror(msg, "Доступ ограничен. Напишите в поддержку.")
         return
     topic = get_current_topic(context)
 
@@ -275,6 +276,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             # сохраняем как последний текст пользователя (для подписи к фото и т.п.)
             context.chat_data["last_user_text"] = (transcribed_text or "").strip()
+
+            try:
+                await mirror_user_message(context.bot, msg, enriched_text or transcribed_text)
+            except Exception:
+                _log_exception("admin_forum mirror user failed")
 
             # глобальный стоп: если расклады закончились, отвечаем paywall на любое сообщение
             if username not in UNLIMITED_USERNAMES:
@@ -352,7 +358,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     return
                 final_text = paywall.strip()
 
-                await msg.reply_text(
+                await reply_and_mirror(
                     final_text,
                     reply_markup=_pro_keyboard(lang),
                 )
@@ -369,6 +375,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             memory_block = build_long_memory_block(user_id, msg.chat_id, lang=lang)
             if memory_block:
                 history_for_model = [{"role": "system", "content": memory_block}] + history_for_model
+            try:
+                prof = get_user_profile_chat(user_id, msg.chat_id) or {}
+                prof_block = build_profile_system_block(prof)
+                if prof_block:
+                    history_for_model = [prof_block] + history_for_model
+            except Exception:
+                _log_exception("profile block failed")
 
             # 5) ask gpt
             try:

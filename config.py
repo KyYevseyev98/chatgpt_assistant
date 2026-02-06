@@ -25,9 +25,13 @@ FREE_PHOTO_LIMIT_PER_DAY = 300
 FREE_TAROT_FREE_COUNT = 3
 FREE_TEXT_FREE_COUNT = 50
 
-# сколько сообщений контекста помним
-MAX_HISTORY_MESSAGES = 30
-MAX_HISTORY_CHARS = 6000
+# ограничения БД/истории (чтобы база не раздувалась)
+MAX_DB_MESSAGES_PER_CHAT = 100  # хранить последние N сообщений на чат
+MAX_TAROT_HISTORY_PER_USER = 100  # хранить последние N раскладов на пользователя
+
+# сколько сообщений контекста помним (для GPT)
+MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_CHARS = 0
 MAX_MESSAGE_CHARS_DB = 2000
 MAX_USER_QUESTION_CHARS = 1200
 PRE_DIALOG_TTL_SEC = 15 * 60
@@ -86,6 +90,10 @@ ADMIN_IDS = [
     int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()
 ]
 
+# форум-группа для зеркалирования диалогов (опционально)
+_forum_chat_id = os.getenv("ADMIN_FORUM_CHAT_ID", "").strip()
+ADMIN_FORUM_CHAT_ID = int(_forum_chat_id) if _forum_chat_id.lstrip("-").isdigit() else None
+
 # --- PRO constants aliases (compat layer) ---
 
 # stars
@@ -97,6 +105,3 @@ PRO_STARS_90_DAYS = PRO_QUARTER_STARS
 PRO_DAYS_7 = 7
 PRO_DAYS_30 = 30
 PRO_DAYS_90 = 90
-# ограничения БД/истории (чтобы база не раздувалась)
-MAX_DB_MESSAGES_PER_CHAT = 200  # хранить последние N сообщений на чат
-MAX_TAROT_HISTORY_PER_USER = 100  # хранить последние N раскладов на пользователя

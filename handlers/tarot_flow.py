@@ -43,7 +43,7 @@ from jobs import schedule_limit_followup
 from handlers.pro import _pro_keyboard
 from config import REFERRAL_REWARD_SPREADS
 from long_memory import build_long_memory_block, maybe_update_long_memory
-from handlers.common import send_smart_answer
+from handlers.common import send_smart_answer, reply_and_mirror, build_profile_system_block
 
 logger = logging.getLogger(__name__)
 
@@ -413,7 +413,7 @@ async def run_tarot_reading_full(
             log_event(user_id, "tarot_paywall", meta="channel:tarot_flow", lang=lang, topic="tarot")
         except Exception:
             _log_exception("paywall log_event failed")
-        await msg.reply_text(final_text, reply_markup=_pro_keyboard(lang))
+        await reply_and_mirror(msg, final_text, reply_markup=_pro_keyboard(lang))
         try:
             if paywall:
                 set_last_paywall_text(user_id, paywall)
@@ -430,7 +430,7 @@ async def run_tarot_reading_full(
         deck = get_default_deck()
     except Exception as e:
         logger.exception("Deck init failed: %s", e)
-        await msg.reply_text("Не могу загрузить колоду (assets/cards). Проверь, что папка и 78 файлов карт на месте.")
+        await reply_and_mirror(msg, "Не могу загрузить колоду (assets/cards). Проверь, что папка и 78 файлов карт на месте.")
         return
 
     spread_name = (getattr(route, "spread_name", "") or "").strip()
@@ -448,12 +448,21 @@ async def run_tarot_reading_full(
 
     intro = None
     try:
+        history = get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES) or []
+        try:
+            prof = get_user_profile_chat(user_id, msg.chat_id) or {}
+            prof_block = build_profile_system_block(prof)
+            if prof_block:
+                history = [prof_block] + history
+        except Exception:
+            _log_exception("profile block failed")
         intro = await tarot_intro_post(
             lang=lang,
             user_question=question_text,
             spread_name=spread_name,
             n_cards=n_cards,
             history_hint=history_hint,
+            history=history,
         )
     except Exception:
         intro = None
@@ -467,17 +476,17 @@ async def run_tarot_reading_full(
         )
 
     try:
-        await msg.reply_text(intro, parse_mode="HTML")
+        await reply_and_mirror(msg, intro, parse_mode="HTML")
     except Exception:
         try:
-            await msg.reply_text(intro)
+            await reply_and_mirror(msg, intro)
         except Exception:
             _log_exception("suppressed exception")
 
     # --- 1) тянем карты ---
     cards = deck.draw(n_cards)
     if not cards:
-        await msg.reply_text("Не удалось вытянуть карты. Проверь колоду (assets/cards).")
+        await reply_and_mirror(msg, "Не удалось вытянуть карты. Проверь колоду (assets/cards).")
         return
 
     positions = _positions_for(len(cards))
@@ -577,12 +586,21 @@ async def run_tarot_reading_full(
     except Exception:
         _log_exception("suppressed exception")
 
+    history = get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES) or []
+    try:
+        prof = get_user_profile_chat(user_id, msg.chat_id) or {}
+        prof_block = build_profile_system_block(prof)
+        if prof_block:
+            history = [prof_block] + history
+    except Exception:
+        _log_exception("profile block failed")
     answer = await tarot_reading_answer(
         lang=lang,
         user_question=question_text,
         spread_name=spread_name,
         cards_payload=cards_payload,
         history_hint=history_hint,
+        history=history,
     )
 
     await send_smart_answer(msg, answer)

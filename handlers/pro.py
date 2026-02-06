@@ -16,6 +16,7 @@ from localization import (
     pro_offer_text,
     pro_success_text,
 )
+from handlers.common import reply_and_mirror
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,8 @@ async def pro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     lang = get_lang(user)
 
-    await update.message.reply_text(
+    await reply_and_mirror(
+        update.message,
         pro_offer_text(lang),
         reply_markup=_pro_keyboard(lang),
         parse_mode="HTML",
@@ -171,7 +173,8 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     except Exception:
         logger.exception("Failed to log tarot purchase")
 
-    await update.message.reply_text(
+    await reply_and_mirror(
+        update.message,
         pro_success_text(lang),
         parse_mode="HTML",
     )
@@ -196,7 +199,7 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pack_key = str(payload.get("pack") or "").strip()
     pack = next((p for p in TAROT_PACKS if p["key"] == pack_key), None)
     if not pack:
-        await msg.reply_text("Не удалось определить пакет. Попробуй ещё раз.")
+        await reply_and_mirror(msg, "Не удалось определить пакет. Попробуй ещё раз.")
         return
 
     spreads = int(pack["spreads"])

@@ -36,6 +36,8 @@ from db import (
     get_followup_personalization_snapshot,
     get_user_memory_snapshot,
     set_last_followup_meta,
+    set_last_followup_context,
+    touch_last_followup_at,
     set_last_paywall_text,
     should_send_limit_paywall,
     # TAROT
@@ -60,6 +62,8 @@ from localization import (
 from gpt_client import (
     is_forbidden_topic,
     ask_gpt,
+    classify_tarot_intent,
+    generate_clarify_question,
     generate_limit_paywall_text,
     generate_limit_paywall_text_via_chat,
     # TAROT router + answer
@@ -68,7 +72,8 @@ from gpt_client import (
 )
 from jobs import schedule_limit_followup
 
-from .common import send_smart_answer, wait_for_media_if_needed, trim_history_for_model
+from .common import send_smart_answer, reply_and_mirror, wait_for_media_if_needed, trim_history_for_model, build_profile_system_block
+from admin_forum import mirror_user_message
 from .pro import _pro_keyboard
 from .tarot_flow import run_tarot_reading_full
 from .topics import get_current_topic
@@ -181,7 +186,7 @@ async def _send_tarot_paywall(
     except Exception:
         _log_exception("paywall log_event failed")
 
-    await msg.reply_text(paywall.strip(), reply_markup=_pro_keyboard(lang))
+    await reply_and_mirror(msg, paywall.strip(), reply_markup=_pro_keyboard(lang))
     try:
         _safe_patch_user_profile_chat(user_id, msg.chat_id, delete_keys=["pending_tarot", "pre_dialog"])
         _set_tarot_session_mode(context, enabled=False)
@@ -388,7 +393,21 @@ def _is_yes_no_question(text: str) -> bool:
     t = _normalize_for_intent(text)
     if not t:
         return False
-    return any(k in t for k in ("да или нет", "да/нет", "да нет", "ответ да или нет", "да?", "нет?")) or t.endswith("?")
+    return any(
+        k in t
+        for k in (
+            "да или нет",
+            "да/нет",
+            "да нет",
+            "ответ да или нет",
+            "да ли",
+            "правда ли",
+            "верно ли",
+            "верно ли что",
+            "это правда",
+            "это так",
+        )
+    )
 
 
 def _infer_cards_count(text: str, *, has_context: bool) -> int:
@@ -655,12 +674,240 @@ def _extract_horizon(text: str) -> str:
     return ""
 
 
-def _build_reflective_prompt(text: str) -> str:
-    t = (text or "").strip()
+def _extract_age(text: str) -> Optional[int]:
+    t = _normalize_for_intent(text)
     if not t:
-        return "Хочу понять тебя точнее, чтобы расклад был честным и полезным."
-    snippet = t[:160]
-    return f"Понимаю. Похоже, тебя особенно цепляет: «{snippet}». Верно?"
+        return None
+    m = re.search(r"\b(\d{1,2})\s*(лет|года|год)\b", t)
+    if not m:
+        return None
+    age = int(m.group(1))
+    if 16 <= age <= 50:
+        return age
+    return None
+
+
+def _extract_gender(text: str) -> Optional[str]:
+    t = _normalize_for_intent(text)
+    if any(k in t for k in ("я парень", "я мужчина", "мужчина")):
+        return "male"
+    if any(k in t for k in ("я девушка", "я женщина", "женщина")):
+        return "female"
+    return None
+
+
+_COMMON_FEMALE_NAMES = {
+    # RU/UA common
+    "анна", "аня", "анастасия", "настя", "наталья", "наташа", "екатерина", "катя",
+    "мария", "маша", "александра", "саша", "ольга", "елена", "лена", "ирина",
+    "юлия", "юля", "светлана", "света", "ксения", "полина", "алёна", "алена",
+    "дарья", "даша", "виктория", "вика", "елизавета", "лиза", "карина",
+    "марина", "татьяна", "таня", "любовь", "любаша", "нина", "валентина",
+    "валя", "лилия", "лиля", "людмила", "люда", "алиса", "анжелика", "анжела",
+    "вера", "вероника", "галина", "гала", "диана", "евгения", "женя", "жанна",
+    "зоя", "инна", "ирина", "кира", "кристина", "лариса", "лидия", "мадина",
+    "маргарита", "рита", "милана", "марианна", "надежда", "надя", "оксана",
+    "ольвия", "ольвия", "оливия", "пелагея", "полина", "рада", "регина",
+    "ромина", "сабина", "снежана", "софия", "софья", "соня", "таисия", "тася",
+    "тамара", "ульяна", "фаина", "яна", "алина", "валерия", "лерa", "диана",
+    "евдокия", "евгения", "елина", "жанна", "инга", "камилла", "каролина",
+    "клара", "клара", "марта", "нелли", "оксана", "павлина", "рада", "рина",
+    "серафима", "стефания", "стеша", "теодора", "фёдора", "эвелина",
+    # UA variants
+    "наталя", "катерина", "олена", "олесья", "олесся", "оксана", "ксенія", "ксенія",
+    "софія", "юлія", "валерія", "дарина", "владислава", "влада", "злата",
+    "любов", "люба", "мар'яна", "марьяна", "марина", "мирослава", "мира",
+}
+
+_COMMON_MALE_NAMES = {
+    # RU/UA common
+    "иван", "ваня", "александр", "саша", "дмитрий", "дима", "сергей", "серёжа", "сережа",
+    "андрей", "павел", "паша", "михаил", "миша", "никита", "артём", "артем",
+    "кирилл", "илья", "максим", "денис", "игорь", "владимир", "вова", "влад",
+    "виктор", "евгений", "женя", "алексей", "лёша", "леша", "анатолий", "анатолій",
+    "борис", "валентин", "валера", "валерий", "виталий", "витя", "григорий",
+    "глеб", "данил", "даниил", "иван", "евгений", "егор", "зенон", "захар",
+    "илья", "константин", "костя", "леонид", "лев", "матвей", "михаил",
+    "николай", "коля", "олег", "пётр", "петр", "роман", "ростислав", "руслан",
+    "савелий", "семён", "семен", "степан", "стас", "станислав", "тимур",
+    "фёдор", "федор", "юрий", "юра", "ярослав",
+    # UA variants
+    "андрій", "олександр", "сергій", "дмитро", "михайло", "петро", "юрій",
+    "олег", "богдан", "василь", "василій", "иван", "іван", "тарас", "остап",
+    "євген", "єгор", "максим", "микола", "миколай", "гриць", "григорій",
+    "ілля", "іван", "львів", "роман", "степан", "станіслав", "тимофій",
+}
+
+_COMMON_FEMALE_NAMES_LAT = {
+    "anna", "anastasia", "natalia", "natasha", "ekaterina", "katya", "maria", "masha",
+    "alexandra", "sasha", "olga", "elena", "irina", "julia", "yulia", "svetlana",
+    "ksenia", "polina", "alena", "alyona", "daria", "dasha", "victoria", "vika",
+    "elizabeth", "liza", "karina", "marina", "tatyana", "vera", "veronica",
+    "kseniya", "sofia", "sonya", "yana", "alina", "valeria", "oksana",
+}
+
+_COMMON_MALE_NAMES_LAT = {
+    "ivan", "alexander", "alexandr", "sasha", "dmitry", "dima", "sergey", "sergei",
+    "andrey", "andrei", "pavel", "pasha", "mikhail", "misha", "nikita", "artem",
+    "artyom", "kirill", "ilya", "ilyas", "maxim", "denis", "igor", "vladimir",
+    "victor", "evgeny", "evgenii", "alexey", "aleksey", "anatoly", "boris",
+    "vitaly", "gleb", "danil", "daniil", "egor", "konstantin", "kostya",
+    "leonid", "lev", "matvey", "nikolai", "oleg", "petr", "roman", "ruslan",
+    "stanislav", "timur", "fedor", "yuri", "yuriy", "yaroslav",
+}
+
+_LAT_TO_CYR = {
+    # male
+    "kirill": "Кирилл",
+    "sergey": "Сергей",
+    "sergei": "Сергей",
+    "alexey": "Алексей",
+    "aleksey": "Алексей",
+    "alexei": "Алексей",
+    "alexander": "Александр",
+    "alexandr": "Александр",
+    "dmitry": "Дмитрий",
+    "dmitriy": "Дмитрий",
+    "andrey": "Андрей",
+    "andrei": "Андрей",
+    "nikita": "Никита",
+    "maxim": "Максим",
+    "ivan": "Иван",
+    "pavel": "Павел",
+    "mikhail": "Михаил",
+    "yuri": "Юрий",
+    "yuriy": "Юрий",
+    "roman": "Роман",
+    "ruslan": "Руслан",
+    "igor": "Игорь",
+    "fedor": "Фёдор",
+    "petr": "Пётр",
+    "oleg": "Олег",
+    # female
+    "natalia": "Наталья",
+    "natasha": "Наташа",
+    "anastasia": "Анастасия",
+    "maria": "Мария",
+    "elena": "Елена",
+    "ekaterina": "Екатерина",
+    "katya": "Катя",
+    "sofia": "София",
+    "sonya": "Соня",
+    "polina": "Полина",
+    "olga": "Ольга",
+    "irina": "Ирина",
+    "yulia": "Юлия",
+    "julia": "Юлия",
+    "svetlana": "Светлана",
+    "ksenia": "Ксения",
+    "kseniya": "Ксения",
+    "oksana": "Оксана",
+    "alina": "Алина",
+    "victoria": "Виктория",
+    "vika": "Вика",
+    "daria": "Дарья",
+    "dasha": "Даша",
+}
+
+
+def _collapse_repeats(s: str) -> str:
+    if not s:
+        return s
+    out = [s[0]]
+    for ch in s[1:]:
+        if ch != out[-1]:
+            out.append(ch)
+    return "".join(out)
+
+
+def _normalize_name_from_account(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    t = raw.strip().lower()
+    # remove non-letters
+    t = re.sub(r"[^a-zа-яёіїєґ']", "", t)
+    if not (3 <= len(t) <= 16):
+        return None
+    if any(x in t for x in ("bot", "admin", "support", "shop", "store", "official")):
+        return None
+    # exact latin -> cyrillic mapping first
+    if t in _LAT_TO_CYR:
+        return _LAT_TO_CYR[t]
+    # exact match before collapsing repeats
+    if t in _COMMON_FEMALE_NAMES or t in _COMMON_MALE_NAMES:
+        return t.capitalize()
+    if t in _COMMON_FEMALE_NAMES_LAT or t in _COMMON_MALE_NAMES_LAT:
+        return t.capitalize()
+    # then try collapsed repeats for noisy nicknames
+    t = _collapse_repeats(t)
+    # diminutive to base (наташка -> наташа)
+    if t.endswith("шка"):
+        candidate = t[:-3] + "ша"
+        if candidate in _COMMON_FEMALE_NAMES:
+            t = candidate
+    if t in _LAT_TO_CYR:
+        return _LAT_TO_CYR[t]
+    if t in _COMMON_FEMALE_NAMES or t in _COMMON_MALE_NAMES:
+        return t.capitalize()
+    if t in _COMMON_FEMALE_NAMES_LAT or t in _COMMON_MALE_NAMES_LAT:
+        return t.capitalize()
+    return None
+
+
+def _infer_gender_from_name(name: str) -> Optional[str]:
+    n = (name or "").strip().lower()
+    if not n:
+        return None
+    if n in _COMMON_FEMALE_NAMES:
+        return "female"
+    if n in _COMMON_MALE_NAMES:
+        return "male"
+    if n in _COMMON_FEMALE_NAMES_LAT:
+        return "female"
+    if n in _COMMON_MALE_NAMES_LAT:
+        return "male"
+    return None
+
+
+def _profile_missing(profile: Dict[str, Any]) -> List[str]:
+    missing = []
+    if not (profile.get("name") or "").strip():
+        missing.append("имя")
+    if not profile.get("age"):
+        missing.append("возраст")
+    return missing
+
+
+def _profile_hint(profile: Dict[str, Any]) -> str:
+    parts = []
+    if profile.get("name"):
+        parts.append(f"имя={profile.get('name')}")
+    if profile.get("age"):
+        parts.append(f"возраст={profile.get('age')}")
+    if profile.get("gender"):
+        parts.append(f"пол={profile.get('gender')}")
+    return ", ".join(parts)
+
+
+def _profile_prompt_for_chat(profile: Dict[str, Any]) -> str:
+    missing = _profile_missing(profile)
+    if not missing:
+        return ""
+    asked_at = profile.get("profile_ask_at")
+    try:
+        if asked_at:
+            last_dt = dt.datetime.fromisoformat(asked_at)
+            if (dt.datetime.utcnow() - last_dt).total_seconds() < 24 * 3600:
+                return ""
+    except Exception:
+        pass
+    # ask only one missing item at a time, gently
+    target = missing[0]
+    if target == "имя":
+        return "Если уместно, мягко спроси, как к нему можно обращаться."
+    if target == "возраст":
+        return "Если уместно, мягко спроси, сколько лет, без давления."
+    return ""
 
 
 def _next_pre_dialog_question(state: Dict[str, Any], user_text: str) -> str:
@@ -671,22 +918,43 @@ def _next_pre_dialog_question(state: Dict[str, Any], user_text: str) -> str:
         return "Хочу понять тебя точнее, чтобы расклад был честным и полезным. О чём это в целом: отношения, работа/деньги, выбор, состояние — или другое?"
     if not horizon:
         return "На какой горизонт хочешь посмотреть: сегодня, ближайшие дни, неделя/месяц, 3 месяца, год?"
+    if not state.get("goal"):
+        return "Что именно ты хочешь узнать? (например: получится ли, перспективы, что делать дальше)"
     if theme == "отношения" and not state.get("context"):
         return "О ком именно речь и что между вами происходит сейчас? (кто этот человек, как вы связаны, что случилось)"
     if not state.get("context"):
         return "Что происходит сейчас в этой ситуации? Можно 2–5 предложений — этого достаточно."
-    if not state.get("goal"):
-        return "Что именно хочешь понять в итоге? (например: чувства, перспектива, что делать дальше)"
     return "Сформулируй один конкретный вопрос, на который хочешь получить ответ через карты."
 
 
 def _update_pre_dialog_state(state: Dict[str, Any], user_text: str) -> Dict[str, Any]:
-    theme = state.get("theme") or _extract_theme(user_text)
-    horizon = state.get("horizon") or _extract_horizon(user_text)
+    new_theme = _extract_theme(user_text)
+    new_horizon = _extract_horizon(user_text)
+    theme = state.get("theme") or new_theme
+    if theme == "другое" and new_theme and new_theme != "другое":
+        theme = new_theme
+    horizon = state.get("horizon") or new_horizon
     context = state.get("context") or (user_text if _has_enough_context(user_text) else "")
     goal = state.get("goal") or (
         user_text
-        if any(k in _normalize_for_intent(user_text) for k in ("хочу", "нужно", "понять", "узнать", "что делать", "как быть"))
+        if any(
+            k in _normalize_for_intent(user_text)
+            for k in (
+                "хочу",
+                "нужно",
+                "понять",
+                "узнать",
+                "что делать",
+                "как быть",
+                "получится",
+                "смогу",
+                "сможет",
+                "успех",
+                "запустить",
+                "запуск",
+                "старт",
+            )
+        ) or _is_yes_no_question(user_text)
         else ""
     )
     requested_cards = state.get("requested_cards") or _extract_requested_cards(user_text)
@@ -709,8 +977,6 @@ def _pre_dialog_is_ready(state: Dict[str, Any]) -> bool:
     if not state.get("theme"):
         return False
     if not state.get("horizon"):
-        return False
-    if not state.get("context"):
         return False
     if not state.get("goal"):
         return False
@@ -755,6 +1021,24 @@ def _is_followup_text(t: str) -> bool:
     if len(t) <= 2:
         return False
     return any(x in t for x in FOLLOWUP_TRIGGERS)
+
+
+def _is_answer_to_tarot_questions(user_text: str, last_bot_message: str) -> bool:
+    """
+    Heuristic: user replies to end-of-reading questions.
+    We treat short/confirming replies to a bot message that contained questions.
+    """
+    u = (user_text or "").strip().lower()
+    if not u:
+        return False
+    lb = (last_bot_message or "").strip()
+    if "?" not in lb:
+        return False
+    if len(u) <= 120:
+        return True
+    if u.startswith(("да", "нет", "не знаю", "не уверен", "думаю", "скорее", "наверное")):
+        return True
+    return False
 
 
 def _route_override_from_trigger(text: str, *, mode: str = "") -> RouteResult:
@@ -980,8 +1264,40 @@ async def _flush_text_batch(
     memory_block = build_long_memory_block(user_id, chat_id, lang=lang)
     if memory_block:
         history_for_model = [{"role": "system", "content": memory_block}] + history_for_model
+    # lightweight profile prompt (ask name/age gently if missing)
+    try:
+        prof = get_user_profile_chat(user_id, chat_id) or {}
+        prof_block = build_profile_system_block(prof)
+        if prof_block:
+            history_for_model = [prof_block] + history_for_model
+        profile_prompt = _profile_prompt_for_chat(prof)
+        if profile_prompt:
+            history_for_model = [{"role": "system", "content": profile_prompt}] + history_for_model
+            patch_user_profile_chat(
+                user_id,
+                chat_id,
+                patch={"profile_ask_at": dt.datetime.utcnow().isoformat()},
+            )
+    except Exception:
+        _log_exception("profile prompt failed")
 
     try:
+        # anti-loop: if assistant repeats same leading question pattern, force variety
+        try:
+            last_assistant = [
+                (m.get("content") or "").strip().lower()
+                for m in history[-6:]
+                if (m.get("role") or "") == "assistant"
+            ]
+            repeated = [t for t in last_assistant if t.startswith("что для тебя важнее")]
+            if len(repeated) >= 2:
+                history_for_model = (
+                    [{"role": "system", "content": "Не повторяй одинаковую формулировку вопроса. Сформулируй вопрос иначе или попроси конкретику."}]
+                    + history_for_model
+                )
+        except Exception:
+            _log_exception("anti-loop check failed")
+
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     except Exception:
         _log_exception("suppressed exception")
@@ -1008,6 +1324,21 @@ async def _flush_text_batch(
         lang=lang,
         topic=topic,
     )
+
+    # если бот предложил расклад — фиксируем invite, чтобы "давай" от пользователя запустило таро
+    try:
+        if _looks_like_tarot_invite(answer):
+            inv_topic = _extract_invite_topic(combined_text) or ""
+            set_last_followup_meta(user_id, followup_type="tarot_invite", followup_topic=inv_topic)
+            # snapshot: current user request + assistant question context
+            set_last_followup_context(
+                user_id,
+                question=combined_text,
+                context=answer,
+            )
+            touch_last_followup_at(user_id)
+    except Exception:
+        _log_exception("set last_followup_meta failed")
 
     # Не включаем tarot_session_mode от мягкого предложения в обычном чате.
     await send_smart_answer(last_msg, answer)
@@ -1250,10 +1581,14 @@ async def _handle_tarot_followup(
 
     last_topic = (snap.get("last_topic") or "").strip().lower()
     last_tarot_meta = snap.get("last_tarot_meta")
+    last_bot_message = (snap.get("last_bot_message") or "")
     if last_topic != "tarot" or not last_tarot_meta:
         return False
 
-    if not _is_followup_text(user_text):
+    if _has_explicit_tarot_trigger(user_text):
+        return False
+
+    if not _is_followup_text(user_text) and not _is_answer_to_tarot_questions(user_text, last_bot_message):
         return False
 
     cards_payload = _cards_payload_from_last_tarot_meta(last_tarot_meta)
@@ -1275,13 +1610,14 @@ async def _handle_tarot_followup(
 
     # ✅ Фоллоу-ап: показываем карты снова (текущий расклад), чтобы не было ответа "в пустоту"
     try:
-        await msg.reply_text(
+        await reply_and_mirror(
+            msg,
             f"🔁 <b>Продолжаю расшифровку</b> расклада «{spread_name}». Карты те же — вот они 👇",
             parse_mode="HTML",
         )
     except Exception:
         try:
-            await msg.reply_text(f"Продолжаю расшифровку расклада «{spread_name}». Карты те же — вот они:")
+            await reply_and_mirror(msg, f"Продолжаю расшифровку расклада «{spread_name}». Карты те же — вот они:")
         except Exception:
             _log_exception("suppressed exception")
 
@@ -1341,12 +1677,21 @@ async def _handle_tarot_followup(
     except Exception:
         _log_exception("suppressed exception")
 
+    history = _safe_get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES)
+    try:
+        prof = get_user_profile_chat(user_id, msg.chat_id) or {}
+        prof_block = build_profile_system_block(prof)
+        if prof_block:
+            history = [prof_block] + history
+    except Exception:
+        _log_exception("profile block failed")
     answer = await tarot_reading_answer(
         lang="ru",
         user_question=f"FOLLOW-UP: {user_text}",
         spread_name=spread_name,
         cards_payload=cards_payload,
         history_hint=personalization,
+        history=history,
     )
 
     answer = _strip_fake_shuffle(answer)
@@ -1407,7 +1752,7 @@ async def _handle_tarot_reading(
             _log_exception("suppressed exception")
 
         final_text = (paywall or "Чтобы продолжить, можно купить расклады.").strip()
-        await msg.reply_text(final_text, reply_markup=_pro_keyboard("ru"))
+        await reply_and_mirror(msg, final_text, reply_markup=_pro_keyboard("ru"))
 
         try:
             if paywall:
@@ -1440,7 +1785,7 @@ async def _handle_tarot_reading(
         deck = get_default_deck()
     except Exception as e:
         logger.exception("Deck init failed: %s", e)
-        await msg.reply_text("Не могу загрузить колоду (assets/cards). Проверь, что папка и 78 файлов карт на месте.")
+        await reply_and_mirror(msg, "Не могу загрузить колоду (assets/cards). Проверь, что папка и 78 файлов карт на месте.")
         return
 
     # сколько карт (ДОЛЖНО прийти от GPT-роутера)
@@ -1466,10 +1811,10 @@ async def _handle_tarot_reading(
 
     intro = _build_intro_post(route, raw_text, n_cards, user_name=user_name)
     try:
-        await msg.reply_text(intro, parse_mode="HTML")
+        await reply_and_mirror(msg, intro, parse_mode="HTML")
     except Exception:
         try:
-            await msg.reply_text(intro.replace("<b>", "").replace("</b>", ""))
+            await reply_and_mirror(msg, intro.replace("<b>", "").replace("</b>", ""))
         except Exception:
             _log_exception("suppressed exception")
 
@@ -1477,7 +1822,7 @@ async def _handle_tarot_reading(
     cards = deck.draw(n_cards)
     logger.warning("TAROT DRAWN n=%s keys=%s", n_cards, [c.key for c in cards])
     if not cards:
-        await msg.reply_text("Не удалось вытянуть карты. Проверь колоду (assets/cards).")
+        await reply_and_mirror(msg, "Не удалось вытянуть карты. Проверь колоду (assets/cards).")
         return
 
     # 2) рендер расклада заранее
@@ -1625,12 +1970,14 @@ async def _handle_tarot_reading(
     except Exception:
         _log_exception("suppressed exception")
 
+    history = _safe_get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES)
     answer = await tarot_reading_answer(
         lang="ru",
         user_question=raw_text,
         spread_name=getattr(route, "spread_name", "") or f"{n_cards} карт",
         cards_payload=cards_payload,
         history_hint=personalization,
+        history=history,
     )
 
     answer = _strip_fake_shuffle(answer)
@@ -1703,12 +2050,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         _log_exception("referral start parse failed")
     try:
+        # persist name/gender on /start
+        first_name = (getattr(user, "first_name", "") or "").strip()
+        username = (getattr(user, "username", "") or "").strip()
+        name_candidate = _normalize_name_from_account(first_name) or _normalize_name_from_account(username)
+        patch_profile = {"lang": (lang or "").strip()}
+        if name_candidate:
+            patch_profile["name"] = name_candidate
+            gender_from_name = _infer_gender_from_name(name_candidate)
+            if gender_from_name:
+                patch_profile["gender"] = gender_from_name
+        update_user_profile_chat_if_new_facts(user.id, update.effective_chat.id, patch_profile)
+    except Exception:
+        _log_exception("start profile enrich failed")
+
+    try:
         set_traffic_source(user.id, source)
     except Exception:
         _log_exception("suppressed exception")
     _safe_log_event(user.id, f"start:{source}", meta=f"source:{source}", lang=lang, topic="start")
 
-    await update.message.reply_text(
+    await reply_and_mirror(
+        update.message,
         start_text_tarot(),
         parse_mode="HTML",
     )
@@ -1724,7 +2087,7 @@ async def reset_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["batch_task"] = None
     _set_tarot_session_mode(context, enabled=False)
 
-    await update.message.reply_text(reset_text(lang))
+    await reply_and_mirror(update.message, reset_text(lang))
 
     _safe_log_event(user.id, "reset", lang=lang)
 
@@ -1747,33 +2110,48 @@ async def _handle_tarot_routing(
         _set_tarot_session_mode(context, enabled=False)
         _clear_pre_dialog_state(user_id, msg.chat_id)
 
-    # recent follow-up invite: start pre-dialog on confirmation
+    # recent follow-up invite: start one-shot clarification on confirmation
     invite = _get_recent_followup_invite(user_id)
     if invite:
         topic = _extract_invite_topic(clean_text or extracted) or invite.get("topic")
         if _exit_tarot_mode_requested(clean_text or extracted):
             return False
         if _is_confirmation_text(clean_text or extracted) or topic:
-            # mark invite as handled to avoid double triggers
             try:
                 set_last_followup_meta(user_id, followup_type="handled", followup_topic=invite.get("topic") or "")
             except Exception:
                 _log_exception("followup invite mark handled failed")
 
-            initial = {
-                "theme": (topic or _extract_theme(clean_text or extracted)),
-                "horizon": _extract_horizon(clean_text or extracted),
-                "context": "",
-                "goal": "",
-                "questions": 1,
-                "consent": True,
-                "expires_at": time.time() + float(PRE_DIALOG_TTL_SEC),
-            }
-            _set_pre_dialog_state(user_id, msg.chat_id, initial)
+            # use stored invite snapshot if available
+            snap = get_followup_personalization_snapshot(user_id) or {}
+            invite_q = (snap.get("last_user_message") or "").strip()
+            invite_ctx = (snap.get("last_bot_message") or "").strip()
+            question_text = invite_q or (clean_text or extracted)
+            if invite_ctx:
+                question_text = f"{question_text}\n\nКонтекст: {invite_ctx}"
+
+            history_for_router = _safe_get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES)
+            try:
+                route_raw = await route_tarot_action(
+                    question_text,
+                    lang="ru",
+                    history_hint="",
+                    history=history_for_router,
+                )
+            except Exception:
+                route_raw = {"action": "reading", "cards": 0, "spread_name": "", "clarify_question": "", "reason": "router_error"}
+            route = normalize_route(route_raw)
+            if getattr(route, "action", "") == "chat":
+                inferred_cards = _infer_cards_count(question_text, has_context=True)
+                route = RouteResult(
+                    action="reading",
+                    cards=inferred_cards,
+                    spread_name="Расклад",
+                    clarify_question="",
+                    reason="force_after_invite",
+                )
             _set_tarot_session_mode(context, enabled=True)
-            reflect = _build_reflective_prompt(clean_text or extracted)
-            question = _next_pre_dialog_question(initial, clean_text or extracted)
-            await send_smart_answer(msg, f"{reflect}\n\n{question}")
+            await run_tarot_reading_full(msg, context, user_id, question_text, route)
             return True
 
     # ✅ Если ранее в рамках расклада мы задали уточняющий вопрос, то следующую
@@ -1811,87 +2189,77 @@ async def _handle_tarot_routing(
         # если что-то пошло не так — просто продолжаем обычный флоу
         _log_exception("suppressed exception")
 
-    # pre-dialog: collect context before allowing tarot
-    pre_state = _get_pre_dialog_state(user_id, msg.chat_id)
-    if _is_pre_dialog_expired(pre_state):
-        _clear_pre_dialog_state(user_id, msg.chat_id)
-        pre_state = {}
-
-    # if user explicitly asked for tarot but context is weak, start pre-dialog immediately
+    # Stage 1: LLM classifier for tarot decision
     trigger_text = _choose_trigger_text(clean_text, extracted)
-    explicit_trigger = _has_explicit_tarot_trigger(trigger_text)
-    if explicit_trigger and not _is_pre_dialog_active(pre_state) and not _has_enough_context(clean_text or extracted):
-        initial = {
-            "theme": _extract_theme(clean_text or extracted),
-            "horizon": _extract_horizon(clean_text or extracted),
-            "context": "",
-            "goal": "",
-            "questions": 1,
-            "consent": True,
-            "requested_cards": _extract_requested_cards(trigger_text),
-            "expires_at": time.time() + float(PRE_DIALOG_TTL_SEC),
-        }
-        _set_pre_dialog_state(user_id, msg.chat_id, initial)
-        reflect = _build_reflective_prompt(clean_text or extracted)
-        question = _next_pre_dialog_question(initial, clean_text or extracted)
-        await send_smart_answer(msg, f"{reflect}\n\n{question}")
+    if _looks_like_tech_question(trigger_text):
+        return False
+
+    history_for_classifier = _safe_get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES)
+    cls = {}
+    try:
+        cls = await classify_tarot_intent(
+            context=history_for_classifier,
+            user_message=trigger_text,
+            lang=lang,
+        )
+    except Exception:
+        _log_exception("tarot intent classify failed")
+        cls = {}
+
+    should_do = bool(cls.get("should_do_tarot"))
+    intent_type = str(cls.get("intent_type") or "normal_chat").strip()
+    confidence = float(cls.get("confidence") or 0.0)
+    proposed_q = str(cls.get("proposed_question") or "").strip()
+    details = cls.get("extracted_details") or {}
+
+    if intent_type == "clarification_needed" and proposed_q:
+        await send_smart_answer(msg, proposed_q)
         return True
-    if _is_pre_dialog_active(pre_state):
-        # update state with latest user text (без reply/forward контекста)
-        user_answer = clean_text if clean_text else extracted
-        updated = _update_pre_dialog_state(pre_state, user_answer)
-        _set_pre_dialog_state(user_id, msg.chat_id, updated)
 
-        if _pre_dialog_is_ready(updated):
-            # explicit consent handling
-            if updated.get("consent") or _has_tarot_consent(user_answer):
-                summary = _build_pre_dialog_summary(updated)
-                req_cards = int(updated.get("requested_cards") or 0)
-                route = RouteResult(
-                    action="reading",
-                    cards=req_cards if 1 <= req_cards <= 7 else 0,
-                    spread_name="Расклад",
-                    clarify_question="",
-                    reason="pre_dialog_consent",
-                )
-                _clear_pre_dialog_state(user_id, msg.chat_id)
-                _set_tarot_session_mode(context, enabled=True)
-                question_text = summary or (clean_text or extracted)
-                await run_tarot_reading_full(msg, context, user_id, question_text, route)
-                return True
+    if should_do and confidence >= 0.92:
+        # Build enriched question from extracted details
+        question_text = trigger_text
+        try:
+            q = (details.get("question") or "").strip()
+            ctx = (details.get("context") or "").strip()
+            spread = (details.get("spread_type") or "").strip()
+            extra_parts = []
+            if q:
+                extra_parts.append(f"Вопрос: {q}")
+            if ctx:
+                extra_parts.append(f"Контекст: {ctx}")
+            if spread:
+                extra_parts.append(f"Тип расклада: {spread}")
+            if extra_parts:
+                question_text = f"{trigger_text}\n\n" + "\n".join(extra_parts)
+        except Exception:
+            pass
 
-            # ask for explicit consent to proceed with tarot
-            await send_smart_answer(
-                msg,
-                "Спасибо, теперь яснее. Хочешь, сделаю расклад по этой теме?",
+        # route tarot (stage 2)
+        try:
+            route_raw = await route_tarot_action(
+                question_text,
+                lang="ru",
+                history_hint="",
+                history=history_for_classifier,
             )
-            return True
+        except Exception:
+            route_raw = {"action": "reading", "cards": 0, "spread_name": "", "clarify_question": "", "reason": "router_error"}
 
-        if int(updated.get("questions", 0)) >= int(PRE_DIALOG_MAX_QUESTIONS):
-            # достигли лимита вопросов, но данных всё ещё не хватает — уточняем конкретно
-            reflect = _build_reflective_prompt(user_answer)
-            question = _next_pre_dialog_question(updated, user_answer)
-            await send_smart_answer(msg, f"{reflect}\n\n{question}")
-            return True
-
-        # ask next gentle question (avoid repeating the same prompt)
-        reflect = _build_reflective_prompt(user_answer)
-        question = _next_pre_dialog_question(updated, user_answer)
-        last_q = str(updated.get("last_question") or "")
-        repeat_count = int(updated.get("repeat_count") or 0)
-        if question == last_q:
-            repeat_count += 1
-        else:
-            repeat_count = 0
-        if repeat_count >= 1:
-            question = (
-                "Давай чуть проще: это про отношения, работу/деньги, выбор или состояние? "
-                "Можно коротко — одно слово."
+        route = normalize_route(route_raw)
+        if getattr(route, "action", "") == "chat":
+            # force tarot if classifier confirmed
+            inferred_cards = _infer_cards_count(question_text, has_context=True)
+            route = RouteResult(
+                action="reading",
+                cards=inferred_cards,
+                spread_name="Расклад",
+                clarify_question="",
+                reason="force_after_classifier",
             )
-        updated["last_question"] = question
-        updated["repeat_count"] = repeat_count
-        _set_pre_dialog_state(user_id, msg.chat_id, updated)
-        await send_smart_answer(msg, f"{reflect}\n\n{question}")
+
+        _set_tarot_session_mode(context, enabled=True)
+        await run_tarot_reading_full(msg, context, user_id, question_text, route)
         return True
 
     # ✅ FOLLOW-UP после расклада: "подробнее" => расширяем текущие карты, без нового расклада
@@ -1904,120 +2272,7 @@ async def _handle_tarot_routing(
         # если что-то пошло не так — просто продолжаем обычный флоу
         _log_exception("suppressed exception")
 
-    # --- Решение о раскладе принимает бот ---
-    # Кнопки дают лишь подсказку mode_hint, но НЕ форсят reading.
-    mode = (context.user_data.get("astra_mode") or "").lower().strip()
-    mode_hint = f"mode_hint:{mode}" if mode else ""
-
-    # ✅ роутер должен видеть и forwarded/reply контекст (иначе "а это что значит?" сломается)
-    router_text = extracted
-
-    session_active = _is_tarot_session_active(context, user_id)
-    need_spread = bot_decides_need_spread(router_text)
-
-    if need_spread:
-        # контекст для роутера (чтобы intent учитывал диалог)
-        history_for_router = _safe_get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES)
-
-        try:
-            route_raw = await route_tarot_action(router_text, lang="ru", history_hint=mode_hint, history=history_for_router)
-        except Exception:
-            route_raw = {"action": "chat", "cards": 0, "spread_name": "", "clarify_question": "", "reason": "router_error"}
-    else:
-        route_raw = {"action": "chat", "cards": 0, "spread_name": "", "clarify_question": "", "reason": "bot_no_spread"}
-
-    route = normalize_route(route_raw)
-    logger.warning("TAROT ROUTE raw=%s normalized=%s text=%s", route_raw, route, router_text[:120])
-
-    # ✅ 100% гарантия: если пользователь явно попросил таро, но роутер ошибся и вернул chat,
-    # всё равно запускаем tarot-flow (иначе GPT-чат может "сыграть" расклад текстом без карт).
-    try:
-        trigger_text = _choose_trigger_text(clean_text, extracted)
-        explicit_trigger = _has_explicit_tarot_trigger(trigger_text)
-        if explicit_trigger and getattr(route, "action", "") == "chat":
-            route = _route_override_from_trigger(trigger_text, mode=mode)
-            logger.warning("TAROT ROUTE OVERRIDE -> %s (explicit=%s)", route, explicit_trigger)
-        # override cards if user requested 1-2 etc.
-        req_cards = _extract_requested_cards(trigger_text)
-        if req_cards and getattr(route, "action", "") == "reading":
-            route = RouteResult(
-                action="reading",
-                cards=int(req_cards),
-                spread_name=getattr(route, "spread_name", "") or "Расклад",
-                clarify_question=getattr(route, "clarify_question", ""),
-                reason="override_requested_cards",
-            )
-        if getattr(route, "action", "") == "reading" and not req_cards:
-            # fallback heuristic: keep 1-3 for simple, 5 for complex
-            inferred = _infer_cards_count(trigger_text, has_context=_has_enough_context(clean_text or extracted))
-            route = RouteResult(
-                action="reading",
-                cards=int(inferred),
-                spread_name=getattr(route, "spread_name", "") or "Расклад",
-                clarify_question=getattr(route, "clarify_question", ""),
-                reason="override_infer_cards",
-            )
-    except Exception:
-        _log_exception("suppressed exception")
-
-    # clarify
-    if route.action == "clarify":
-        await send_smart_answer(msg, route.clarify_question)
-        # Запоминаем, что мы ждём уточнение для таро. Следующее сообщение
-        # пользователя будет воспринято как ответ на уточняющий вопрос.
-        _safe_patch_user_profile_chat(
-            user_id,
-            msg.chat_id,
-            patch={
-                "pending_tarot": {
-                    "status": "awaiting_clarification",
-                    "asked_at": int(time.time()),
-                    "clarify_question": route.clarify_question,
-                    "original_text": router_text,
-                    # дефолтный расклад на 3 карты, если роутер не указал иначе
-                    "cards": int(route.cards) if int(route.cards or 0) > 0 else 3,
-                    "spread_name": (route.spread_name or "Расклад") or "Расклад",
-                }
-            },
-        )
-        _safe_log_event(user_id, "tarot_clarify", lang="ru", topic="tarot")
-        return True
-
-    # reading (ТЗ: нельзя гадать без явного триггера)
-    if route.action == "reading":
-        trigger_text = _choose_trigger_text(clean_text, extracted)
-        explicit = _has_explicit_tarot_trigger(trigger_text)
-        allow_tarot = explicit
-
-        if not allow_tarot:
-            # безопасный фолбэк: обычный чат
-            _safe_log_event(user_id, "tarot_blocked_no_trigger", lang=lang, topic=topic)
-            return False
-
-        # start pre-dialog after explicit consent (don't auto-generate a reading without it)
-        if explicit and not session_active:
-            initial = {
-                "theme": _extract_theme(clean_text or extracted),
-                "horizon": _extract_horizon(clean_text or extracted),
-                "context": "",
-                "goal": "",
-                "questions": 1,
-                "consent": True,
-                "requested_cards": _extract_requested_cards(clean_text or extracted),
-                "expires_at": time.time() + float(PRE_DIALOG_TTL_SEC),
-            }
-            _set_pre_dialog_state(user_id, msg.chat_id, initial)
-            reflect = _build_reflective_prompt(clean_text or extracted)
-            question = _next_pre_dialog_question(initial, clean_text or extracted)
-            await send_smart_answer(msg, f"{reflect}\n\n{question}")
-            return True
-        # снимаем one-shot триггер
-        context.user_data["astra_mode_armed"] = False
-        _set_tarot_session_mode(context, enabled=True)
-        # ✅ вопрос в таро = extracted (чистый текст + источники)
-        await run_tarot_reading_full(msg, context, user_id, router_text, route)
-        return True
-
+    # Stage 1 classifier already handled tarot routing above.
     return False
 
 
@@ -2043,7 +2298,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _log_exception("update_user_identity failed")
 
     if is_user_blocked(user_id):
-        await msg.reply_text("Доступ ограничен. Напишите в поддержку.")
+        await reply_and_mirror(msg, "Доступ ограничен. Напишите в поддержку.")
         return
 
     # --- дедуп апдейтов (иногда PTB/сеть дублирует) ---
@@ -2070,6 +2325,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not extracted.strip():
         return
 
+    try:
+        await mirror_user_message(context.bot, msg, extracted)
+    except Exception:
+        _log_exception("admin_forum mirror user failed")
+
     # last_user_text = "чистый" (для подписи к фото и т.п.)
     if clean_text:
         context.chat_data["last_user_text"] = clean_text
@@ -2080,7 +2340,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _exit_tarot_mode_requested(check_text):
         _set_tarot_session_mode(context, enabled=False)
     if is_forbidden_topic(check_text):
-        await msg.reply_text(forbidden_reply(lang))
+        await reply_and_mirror(msg, forbidden_reply(lang))
         _safe_log_event(user_id, "forbidden_text", lang=lang)
         return
 
@@ -2115,16 +2375,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- профиль (user_id + chat_id) обновляем только если появились новые факты ---
     try:
-        update_user_profile_chat_if_new_facts(
-            user_id,
-            msg.chat_id,
-            {
-                "name": (getattr(user, "first_name", "") or "").strip(),
-                "lang": (lang or "").strip(),
-            },
-        )
+        first_name = (getattr(user, "first_name", "") or "").strip()
+        username = (getattr(user, "username", "") or "").strip()
+        name_candidate = _normalize_name_from_account(first_name) or _normalize_name_from_account(username)
+        patch_profile = {"lang": (lang or "").strip()}
+        if name_candidate:
+            patch_profile["name"] = name_candidate
+            gender_from_name = _infer_gender_from_name(name_candidate)
+            if gender_from_name:
+                patch_profile["gender"] = gender_from_name
+        update_user_profile_chat_if_new_facts(user_id, msg.chat_id, patch_profile)
     except Exception:
         _log_exception("suppressed exception")
+
+    # capture age/gender from user text if present
+    try:
+        age = _extract_age(clean_text or extracted)
+        gender = _extract_gender(clean_text or extracted)
+        patch = {}
+        if age:
+            patch["age"] = age
+        if gender:
+            patch["gender"] = gender
+        if patch:
+            update_user_profile_chat_if_new_facts(user_id, msg.chat_id, patch)
+    except Exception:
+        _log_exception("profile enrich failed")
 
     # unified tarot routing (shared across text/voice/photo)
     if await _handle_tarot_routing(
@@ -2172,7 +2448,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         final_text = paywall.strip()
 
-        await msg.reply_text(final_text, reply_markup=_pro_keyboard(lang))
+        await reply_and_mirror(msg, final_text, reply_markup=_pro_keyboard(lang))
         try:
             set_last_paywall_text(user_id, paywall)
         except Exception:

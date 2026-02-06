@@ -1,5 +1,6 @@
 /* global Telegram */
-const API_BASE_URL = "https://api.astrabotai.online/";
+const API_BASE_URL = "https://api.astrabotai.online";
+const API = API_BASE_URL.replace(/\/+$/, "");
 const tg = window.Telegram?.WebApp || null;
 const balanceEl = document.getElementById("balanceValue");
 const packsEl = document.getElementById("packs");

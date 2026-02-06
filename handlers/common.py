@@ -7,6 +7,8 @@ import html
 from typing import Optional, Dict, Any, List, Tuple
 
 from telegram.constants import ChatAction
+
+from admin_forum import mirror_bot_message
 from config import MAX_HISTORY_CHARS, MAX_HISTORY_MESSAGES
 
 logger = logging.getLogger(__name__)
@@ -251,6 +253,27 @@ def trim_history_for_model(
     return trimmed
 
 
+def build_profile_system_block(profile: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """
+    Build a system message with profile info (name/age/gender) if present.
+    """
+    if not profile:
+        return None
+    parts = []
+    name = (profile.get("name") or "").strip()
+    age = profile.get("age")
+    gender = (profile.get("gender") or "").strip()
+    if name:
+        parts.append(f"имя={name}")
+    if age:
+        parts.append(f"возраст={age}")
+    if gender:
+        parts.append(f"пол={gender}")
+    if not parts:
+        return None
+    return {"role": "system", "content": "Профиль пользователя: " + ", ".join(parts)}
+
+
 # =========================================================
 # MEDIA LOCK (ВАЖНО)
 # =========================================================
@@ -361,6 +384,10 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
+        try:
+            await mirror_bot_message(message, answer, bot=getattr(message, "_bot", None))
+        except Exception:
+            logger.exception("admin_forum mirror bot failed")
         return
 
     first_text_sent = False
@@ -408,6 +435,19 @@ async def send_smart_answer(message, answer: str, reply_markup=None):
                     first_text_sent = True
                 else:
                     await message.reply_text(plain)
+
+    try:
+        await mirror_bot_message(message, answer, bot=getattr(message, "_bot", None))
+    except Exception:
+        logger.exception("admin_forum mirror bot failed")
+
+
+async def reply_and_mirror(message, text: str, **kwargs):
+    await message.reply_text(text, **kwargs)
+    try:
+        await mirror_bot_message(message, text, bot=getattr(message, "_bot", None))
+    except Exception:
+        logger.exception("admin_forum mirror bot failed")
 
 
 # =========================================================

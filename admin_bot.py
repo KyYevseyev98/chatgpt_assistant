@@ -1097,6 +1097,23 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
+async def debug_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _ensure_admin(update):
+        return
+    msg = update.message
+    if not msg:
+        return
+    chat_id = msg.chat_id
+    chat_type = msg.chat.type if msg.chat else "unknown"
+    title = msg.chat.title if msg.chat else ""
+    text = (
+        f"chat_id: <code>{chat_id}</code>\n"
+        f"type: <code>{chat_type}</code>\n"
+        f"title: <code>{_h(title)}</code>"
+    )
+    await msg.reply_text(text, parse_mode="HTML")
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /stats [period] [source]
@@ -1370,6 +1387,7 @@ def main():
     app = ApplicationBuilder().token(ADMIN_TG_TOKEN).build()
 
     app.add_handler(CommandHandler("start", admin_start))
+    app.add_handler(CommandHandler("debug_chat_id", debug_chat_id))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("offers", offers_command))
     app.add_handler(CommandHandler("user", user_command))

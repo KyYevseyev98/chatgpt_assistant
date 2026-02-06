@@ -178,6 +178,117 @@ async def ask_chat(history: History, lang: str = "ru") -> str:
     return answer
 
 
+async def generate_clarify_question(
+    *,
+    lang: str,
+    user_text: str,
+    missing: List[str],
+    profile_hint: str = "",
+    history: Optional[History] = None,
+) -> str:
+    """Ask a short, natural clarifying question based on missing fields."""
+    missing_str = ", ".join(missing)
+    history_lines = []
+    if history:
+        for m in history[-6:]:
+            role = (m.get("role") or "").strip()
+            content = (m.get("content") or "").strip().replace("\n", " ")
+            if content:
+                if len(content) > 220:
+                    content = content[:220] + "…"
+                history_lines.append(f"{role}: {content}")
+    history_block = "\n".join(history_lines)
+    prompt = (
+        "Сформулируй один короткий человеческий вопрос для уточнения перед раскладом. "
+        "Без шаблонных фраз. Не предлагай расклад, не упоминай карты. "
+        f"Не хватает: {missing_str}. "
+        f"Запрос пользователя: {user_text!r}. "
+        + (f"Профиль: {profile_hint}\n" if profile_hint else "")
+        + (f"\nКонтекст диалога:\n{history_block}\n" if history_block else "")
+    )
+    out = await _chat_complete(
+        [
+            {"role": "system", "content": astra_system_prompt(lang)},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.6,
+        max_tokens=120,
+    )
+    return (out or "").strip()
+
+
+async def classify_tarot_intent(
+    *,
+    context: History,
+    user_message: str,
+    lang: str = "ru",
+) -> Dict[str, Any]:
+    """
+    Stage 1 intent classifier for tarot decision.
+    Returns strict JSON dict with fields:
+    should_do_tarot, intent_type, confidence, what_missing, extracted_details, proposed_question
+    """
+    ctx_lines = []
+    for m in (context or [])[-30:]:
+        role = (m.get("role") or "").strip()
+        content = (m.get("content") or "").strip().replace("\n", " ")
+        if content:
+            if len(content) > 260:
+                content = content[:260] + "…"
+            ctx_lines.append(f"{role}: {content}")
+    ctx_block = "\n".join(ctx_lines)
+
+    prompt = (
+        "Ты — сверхосторожный определитель намерений для таролога. "
+        "Анализируй последние 30 сообщений (весь контекст) + текущее сообщение.\n\n"
+        "Строгие правила:\n"
+        "• \"should_do_tarot\": true ТОЛЬКО если:\n"
+        "  - Пользователь прямо попросил расклад и в контексте уже есть достаточно деталей "
+        "(вопрос/ситуация описана в 2+ предложениях, тип расклада ясен или подразумевается).\n"
+        "  - ИЛИ это явное согласие (\"да\", \"давай\", \"ок\", \"сделай\") на твой предыдущий вопрос "
+        "вроде \"Хочешь, я сделаю расклад?\" И детали уже собраны из прошлых сообщений.\n"
+        "• Если деталей мало → clarification_needed с конкретным what_missing.\n"
+        "• Confidence < 0.90 → всегда should_do_tarot=false.\n"
+        "• Игнорируй ложные триггеры: \"что думаешь?\", \"посоветуй без карт\", \"расскажи про Таро в общем\".\n"
+        "• Учитывай весь контекст: если в прошлых 30 сообщениях уже обсуждали детали — суммируй их в extracted_details.\n\n"
+        "Выводи ТОЛЬКО JSON:\n"
+        "{\n"
+        "  \"should_do_tarot\": true | false,\n"
+        "  \"intent_type\": \"direct_request\" | \"agreement_to_offer\" | \"clarification_needed\" | \"normal_chat\",\n"
+        "  \"confidence\": 0.00–1.00,\n"
+        "  \"what_missing\": [\"question_details\", \"situation_context\", \"spread_type\"],\n"
+        "  \"extracted_details\": {\n"
+        "    \"question\": \"строчка с вопросом\",\n"
+        "    \"context\": \"2–3 предложения о ситуации\",\n"
+        "    \"spread_type\": \"тип или null\"\n"
+        "  },\n"
+        "  \"proposed_question\": \"естественный уточняющий вопрос\"\n"
+        "}\n\n"
+        f"LAST_30:\n{ctx_block}\n\n"
+        f"USER_MESSAGE:\n{user_message}\n"
+    )
+
+    raw = await _chat_complete(
+        [
+            {"role": "system", "content": astra_system_prompt(lang)},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=260,
+    )
+    data = safe_json_loads(raw)
+    if not isinstance(data, dict):
+        return {
+            "should_do_tarot": False,
+            "intent_type": "normal_chat",
+            "confidence": 0.0,
+            "what_missing": [],
+            "extracted_details": {},
+            "proposed_question": "",
+        }
+    return data
+
+
 async def summarize_long_memory(
     *,
     history: History,
@@ -399,13 +510,11 @@ async def tarot_intro_post(
     if MAX_HISTORY_CHARS:
         history_hint = history_hint[: int(MAX_HISTORY_CHARS)]
     prompt = (
-        "Напиши короткий пост-ответ перед раскладом Таро. Это отдельное сообщение ПЕРЕД тем, как показать карты. "
-        "Тон: продолжение текущего диалога — ровно в том же стиле и ритме. "
-        "Пиши конкретно и по делу, без эзотерики и без слова «ясность». "
-        "Структура: 1–2 коротких абзаца (не длиннее 5–7 строк). "
-        "Эмодзи: 0–2, только уместно. "
-        "Нельзя: описывать процесс 'тасую/вытягиваю'. "
-        "Обязательно: показать, что ты поняла контекст, и что сейчас посмотришь по картам.\n\n"
+        "Короткий пост-ответ перед раскладом (1–2 абзаца). "
+        "Продолжай текущий диалог, без эзотерики и без слова «ясность». "
+        "Скажи, что сейчас посмотрим по картам. "
+        "Эмодзи 0–2, уместно. "
+        "Не описывай процесс 'тасую/вытягиваю'.\n\n"
         f"Название расклада: {spread_name}. Карт: {n_cards}.\n"
         f"Запрос: {user_question}\n"
         + (f"\nКонтекст: {history_hint}\n" if history_hint else "")
@@ -426,6 +535,7 @@ async def tarot_reading_answer(
     spread_name: str,
     cards_payload: List[Dict[str, Any]],
     history_hint: str = "",
+    history: list | None = None,
 ) -> str:
     """
     cards_payload приходит из build_cards_payload()
@@ -497,12 +607,11 @@ async def tarot_reading_answer(
     )
 
 
-    return await _chat_complete(
-        [
-            {"role": "system", "content": astra_system_prompt(lang)},
-            {"role": "user", "content": prompt},
-        ]
-    )
+    msgs: MessageList = [{"role": "system", "content": astra_system_prompt(lang)}]
+    if history:
+        msgs.extend(history[-50:])
+    msgs.append({"role": "user", "content": prompt})
+    return await _chat_complete(msgs)
 
 
 # =========================

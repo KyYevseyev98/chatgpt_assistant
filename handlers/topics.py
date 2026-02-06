@@ -5,6 +5,7 @@ from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from handlers.common import reply_and_mirror
 
 # =========================
 #  TOPIC MODEL
@@ -64,7 +65,8 @@ async def topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Команда /topics — просто UI для выбора темы.
     Никакой логики маршрутизации здесь быть не должно.
     """
-    await update.message.reply_text(
+    await reply_and_mirror(
+        update.message,
         "Выбери тему (это влияет только на контекст и аналитику):",
         reply_markup=_topics_keyboard(),
     )
