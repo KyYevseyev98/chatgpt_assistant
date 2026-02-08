@@ -83,17 +83,27 @@ async function createInvoice(packKey) {
       showError();
       return;
     }
-    const open = tg.openInvoice(data.invoice_link, (status) => {
-      if (status === "paid") {
-        refreshBalance();
-      }
-    });
-    if (open && typeof open.then === "function") {
-      open.then((status) => {
+    if (!tg.openInvoice) {
+      tg.openTelegramLink(data.invoice_link);
+      return;
+    }
+    try {
+      const open = tg.openInvoice(data.invoice_link, (status) => {
         if (status === "paid") {
           refreshBalance();
         }
       });
+      if (open && typeof open.then === "function") {
+        open.then((status) => {
+          if (status === "paid") {
+            refreshBalance();
+          }
+        });
+      }
+    } catch (e) {
+      setError(`openInvoice failed: ${e?.message || e}`);
+      showError();
+      tg.openTelegramLink(data.invoice_link);
     }
   } catch (e) {
     setError(`invoice error: ${e?.message || e}`);
