@@ -40,13 +40,65 @@ function renderPacks(packs) {
     btn.textContent = "Купить";
     btn.addEventListener("click", () => {
       if (tg) {
-        tg.sendData(JSON.stringify({ action: "buy_pack", pack: p.key }));
-        tg.close();
+        createInvoice(p.key);
       }
     });
     row.appendChild(btn);
     packsEl.appendChild(row);
   });
+}
+
+async function refreshBalance() {
+  if (!sessionToken) return;
+  try {
+    const resp = await fetch(`${API}/api/balance`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: sessionToken }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      balanceEl.textContent = `${data.balance} раскладов`;
+    }
+  } catch (e) {
+    setError(`balance refresh failed: ${e?.message || e}`);
+  }
+}
+
+async function createInvoice(packKey) {
+  if (!sessionToken) {
+    setError("no session");
+    showError();
+    return;
+  }
+  try {
+    const resp = await fetch(`${API}/api/invoice`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session: sessionToken, pack_key: packKey }),
+    });
+    const data = await resp.json();
+    if (!data.ok || !data.invoice_link) {
+      setError(data.message || "invoice failed");
+      showError();
+      return;
+    }
+    const open = tg.openInvoice(data.invoice_link, (status) => {
+      if (status === "paid") {
+        refreshBalance();
+      }
+    });
+    if (open && typeof open.then === "function") {
+      open.then((status) => {
+        if (status === "paid") {
+          refreshBalance();
+        }
+      });
+    }
+  } catch (e) {
+    setError(`invoice error: ${e?.message || e}`);
+    showError();
+  }
 }
 
 async function auth() {

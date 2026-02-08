@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import httpx
 
 from config import TG_TOKEN, BOT_USERNAME, TAROT_PACKS
 from db_layer.billing import get_billing_snapshot
@@ -38,6 +39,11 @@ class AuthRequest(BaseModel):
 
 class SessionRequest(BaseModel):
     session: str
+
+
+class InvoiceRequest(BaseModel):
+    session: str
+    pack_key: str
 
 
 def _check_init_data(init_data: str, bot_token: str) -> Dict[str, Any]:
@@ -201,6 +207,49 @@ def api_balance(payload: SessionRequest):
         return _error_response("server_error", 500, "failed to load billing")
     balance = int(snap.get("tarot_free_left", 0)) + int(snap.get("tarot_credits", 0))
     return {"ok": True, "version": API_VERSION, "balance": balance}
+
+
+@app.post("/api/invoice")
+def api_invoice(payload: InvoiceRequest):
+    try:
+        user_id = _get_user_id_from_session(payload.session)
+    except Exception:
+        return _error_response("auth_failed", 401, "session invalid or expired")
+
+    pack_key = str(payload.pack_key or "").strip()
+    pack = next((p for p in TAROT_PACKS if p["key"] == pack_key), None)
+    if not pack:
+        return _error_response("bad_pack", 400, "unknown pack")
+
+    spreads = int(pack["spreads"])
+    stars = int(pack["stars"])
+    payload_id = f"tarot_pack_{pack_key}:user:{user_id}:ts:{int(time.time())}"
+
+    logger.info("INVOICE_REQUEST user_id=%s pack=%s", user_id, pack_key)
+
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/createInvoiceLink",
+            json={
+                "title": f"{spreads} раскладов",
+                "description": "Покупка пакета раскладов.",
+                "payload": payload_id,
+                "provider_token": "",
+                "currency": "XTR",
+                "prices": [{"label": f"{spreads} раскладов", "amount": stars}],
+            },
+            timeout=10.0,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning("INVOICE_LINK_FAILED user_id=%s pack=%s resp=%s", user_id, pack_key, data)
+            return _error_response("invoice_failed", 500, "failed to create invoice link")
+        link = data.get("result")
+        logger.info("INVOICE_LINK_CREATED user_id=%s pack=%s payload=%s", user_id, pack_key, payload_id)
+        return {"ok": True, "invoice_link": link}
+    except Exception:
+        logger.exception("INVOICE_LINK_EXCEPTION user_id=%s pack=%s", user_id, pack_key)
+        return _error_response("invoice_failed", 500, "failed to create invoice link")
 
 
 @app.get("/api/health")
