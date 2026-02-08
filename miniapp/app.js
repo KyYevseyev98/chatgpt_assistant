@@ -91,12 +91,18 @@ async function createInvoice(packKey) {
       const open = tg.openInvoice(data.invoice_link, (status) => {
         if (status === "paid") {
           refreshBalance();
+        } else if (status === "cancelled" || status === "failed") {
+          setError(`invoice ${status}`);
+          showError();
         }
       });
       if (open && typeof open.then === "function") {
         open.then((status) => {
           if (status === "paid") {
             refreshBalance();
+          } else if (status === "cancelled" || status === "failed") {
+            setError(`invoice ${status}`);
+            showError();
           }
         });
       }

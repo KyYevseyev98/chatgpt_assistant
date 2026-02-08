@@ -234,13 +234,16 @@ def api_invoice(payload: InvoiceRequest):
                 "title": f"{spreads} раскладов",
                 "description": "Покупка пакета раскладов.",
                 "payload": payload_id,
-                "provider_token": "",
                 "currency": "XTR",
                 "prices": [{"label": f"{spreads} раскладов", "amount": stars}],
             },
             timeout=10.0,
         )
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"ok": False, "raw": resp.text}
+        logger.info("INVOICE_TG_RESPONSE status=%s body=%s", resp.status_code, data)
         if not data.get("ok"):
             logger.warning("INVOICE_LINK_FAILED user_id=%s pack=%s resp=%s", user_id, pack_key, data)
             return _error_response("invoice_failed", 500, "failed to create invoice link")
