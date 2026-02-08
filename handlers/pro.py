@@ -147,6 +147,12 @@ async def pro_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user = update.effective_user
+        payload = update.pre_checkout_query.invoice_payload
+        logger.info("PRE_CHECKOUT user_id=%s payload=%s", getattr(user, "id", None), payload)
+    except Exception:
+        logger.exception("PRE_CHECKOUT log failed")
     await update.pre_checkout_query.answer(ok=True)
 
 
@@ -155,10 +161,18 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     lang = get_lang(user)
 
     payload = update.message.successful_payment.invoice_payload
+    logger.info(
+        "SUCCESSFUL_PAYMENT user_id=%s amount=%s payload=%s",
+        getattr(user, "id", None),
+        update.message.successful_payment.total_amount,
+        payload,
+    )
     if not payload.startswith("tarot_pack_"):
         return
 
     pack_key = payload.replace("tarot_pack_", "").strip()
+    if ":" in pack_key:
+        pack_key = pack_key.split(":", 1)[0].strip()
     pack = next((p for p in TAROT_PACKS if p["key"] == pack_key), None)
     if not pack:
         return
@@ -187,10 +201,12 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user = update.effective_user
     data = msg.web_app_data.data or ""
+    logger.info("WEBAPP_DATA user_id=%s chat_id=%s raw=%s", getattr(user, "id", None), msg.chat_id, data)
     try:
         payload = json.loads(data)
     except Exception:
         payload = {}
+    logger.info("WEBAPP_DATA parsed user_id=%s action=%s pack=%s", getattr(user, "id", None), payload.get("action"), payload.get("pack"))
 
     action = payload.get("action")
     if action != "buy_pack":
@@ -204,17 +220,22 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     spreads = int(pack["spreads"])
     stars = int(pack["stars"])
-    payload_id = f"tarot_pack_{pack_key}"
+    payload_id = f"tarot_pack_{pack_key}:{user.id}"
     title = f"{spreads} раскладов"
     description = "Покупка пакета раскладов."
     prices = [LabeledPrice(label=title, amount=stars)]
 
-    await context.bot.send_invoice(
-        chat_id=msg.chat_id,
-        title=title,
-        description=description,
-        payload=payload_id,
-        provider_token="",
-        currency="XTR",
-        prices=prices,
-    )
+    try:
+        await context.bot.send_invoice(
+            chat_id=msg.chat_id,
+            title=title,
+            description=description,
+            payload=payload_id,
+            provider_token="",
+            currency="XTR",
+            prices=prices,
+        )
+        logger.info("INVOICE_SENT user_id=%s pack=%s stars=%s", getattr(user, "id", None), pack_key, stars)
+    except Exception:
+        logger.exception("send_invoice failed pack=%s", pack_key)
+        await reply_and_mirror(msg, "Оплата временно недоступна, попробуйте позже.")
