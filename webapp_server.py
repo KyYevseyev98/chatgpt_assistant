@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import httpx
@@ -210,7 +210,7 @@ def api_balance(payload: SessionRequest):
 
 
 @app.post("/api/invoice")
-def api_invoice(payload: InvoiceRequest):
+def api_invoice(payload: InvoiceRequest, request: Request):
     try:
         user_id = _get_user_id_from_session(payload.session)
     except Exception:
@@ -225,7 +225,13 @@ def api_invoice(payload: InvoiceRequest):
     stars = int(pack["stars"])
     payload_id = f"tarot_pack_{pack_key}:user:{user_id}:ts:{int(time.time())}"
 
-    logger.info("INVOICE_REQUEST user_id=%s pack=%s", user_id, pack_key)
+    logger.info(
+        "INVOICE_REQUEST user_id=%s pack=%s ip=%s ua=%s",
+        user_id,
+        pack_key,
+        request.client.host if request.client else "unknown",
+        request.headers.get("user-agent", "")[:180],
+    )
 
     try:
         resp = httpx.post(
@@ -263,3 +269,13 @@ def api_health():
 # static miniapp
 if STATIC_DIR.exists():
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="miniapp")
+@app.get("/")
+def serve_index():
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.exists():
+        return _error_response("not_found", 404, "index.html not found")
+    resp = FileResponse(str(index_path), media_type="text/html")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp

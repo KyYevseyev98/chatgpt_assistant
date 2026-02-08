@@ -2214,6 +2214,15 @@ async def _handle_tarot_routing(
 
     if intent_type == "clarification_needed" and proposed_q:
         await send_smart_answer(msg, proposed_q)
+        # важно: сохраняем диалог, иначе модель "не помнит" что уже спрашивала
+        user_text_for_db = extracted or clean_text or trigger_text
+        _safe_add_user_and_assistant_messages(user_id, msg.chat_id, user_text_for_db, proposed_q)
+        _safe_set_last_context(
+            user_id,
+            topic=topic,
+            last_user_message=user_text_for_db,
+            last_bot_message=proposed_q,
+        )
         return True
 
     if should_do and confidence >= 0.92:

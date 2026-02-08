@@ -14,6 +14,16 @@ const diagUser = document.getElementById("diagUser");
 const diagErr = document.getElementById("diagErr");
 let sessionToken = null;
 
+function pluralizeSpreads(n) {
+  const abs = Math.abs(Number(n) || 0);
+  const mod100 = abs % 100;
+  const mod10 = abs % 10;
+  if (mod100 >= 11 && mod100 <= 14) return "раскладов";
+  if (mod10 === 1) return "расклад";
+  if (mod10 >= 2 && mod10 <= 4) return "расклада";
+  return "раскладов";
+}
+
 function setDiag() {
   const tgAvailable = !!tg;
   const userId = tg?.initDataUnsafe?.user?.id || "—";
@@ -23,6 +33,11 @@ function setDiag() {
 
 function setError(text) {
   diagErr.textContent = `error: ${text || "—"}`;
+}
+
+function trace(text) {
+  const prev = diagErr.textContent.replace(/^error:\s*/i, "");
+  diagErr.textContent = `error: ${text}${prev && prev !== "—" ? " | " + prev : ""}`;
 }
 
 function showError() {
@@ -40,6 +55,7 @@ function renderPacks(packs) {
     btn.textContent = "Купить";
     btn.addEventListener("click", () => {
       if (tg) {
+        trace(`clicked pack=${p.key}`);
         createInvoice(p.key);
       }
     });
@@ -58,7 +74,7 @@ async function refreshBalance() {
     });
     const data = await resp.json();
     if (data.ok) {
-      balanceEl.textContent = `${data.balance} раскладов`;
+      balanceEl.textContent = `${data.balance} ${pluralizeSpreads(data.balance)}`;
     }
   } catch (e) {
     setError(`balance refresh failed: ${e?.message || e}`);
@@ -71,6 +87,7 @@ async function createInvoice(packKey) {
     showError();
     return;
   }
+  trace(`invoice request started pack=${packKey}`);
   try {
     const resp = await fetch(`${API}/api/invoice`, {
       method: "POST",
@@ -78,17 +95,20 @@ async function createInvoice(packKey) {
       body: JSON.stringify({ session: sessionToken, pack_key: packKey }),
     });
     const data = await resp.json();
+    trace(`invoice response ok=${data.ok ? "yes" : "no"}`);
     if (!data.ok || !data.invoice_link) {
       setError(data.message || "invoice failed");
       showError();
       return;
     }
     if (!tg.openInvoice) {
+      trace("openInvoice unavailable, fallback link");
       tg.openTelegramLink(data.invoice_link);
       return;
     }
     try {
       const open = tg.openInvoice(data.invoice_link, (status) => {
+        trace(`invoice status=${status}`);
         if (status === "paid") {
           refreshBalance();
         } else if (status === "cancelled" || status === "failed") {
@@ -98,6 +118,7 @@ async function createInvoice(packKey) {
       });
       if (open && typeof open.then === "function") {
         open.then((status) => {
+          trace(`invoice status=${status}`);
           if (status === "paid") {
             refreshBalance();
           } else if (status === "cancelled" || status === "failed") {
@@ -172,7 +193,7 @@ async function auth() {
       /* ignore */
     }
   }
-  balanceEl.textContent = `${data.balance} раскладов`;
+  balanceEl.textContent = `${data.balance} ${pluralizeSpreads(data.balance)}`;
   refLinkEl.value = data.ref_link || "—";
   renderPacks(data.packages || []);
   if (data.support_link) {
