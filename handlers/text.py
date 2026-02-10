@@ -235,6 +235,7 @@ async def handle_tarot_flow(
     await run_tarot_reading_full(msg, context, user.id, question_text, route, lang=lang)
 
 BATCH_DELAY_SEC = 0.4
+CLARIFY_TTL_SEC = 20 * 60
 
 # ---- paths (жёстко от файла, чтобы не зависеть от cwd) ----
 BASE_DIR = Path(__file__).resolve().parents[1]  # project root (рядом с assets/)
@@ -420,9 +421,9 @@ def _infer_cards_count(text: str, *, has_context: bool) -> int:
     length = len((text or "").strip())
     tokens = len(t.split())
     complex_markers = ("почему", "что делать", "как быть", "перспектива", "разбор", "глубже", "сложно", "комплекс")
-    if any(k in t for k in complex_markers) and (tokens >= 12 or has_context):
-        return 5
-    if tokens <= 8 and length <= 70:
+    if any(k in t for k in complex_markers) and (tokens >= 18 or length >= 160) and has_context:
+        return 4
+    if tokens <= 10 and length <= 80:
         return 2
     return 3
 
@@ -514,6 +515,36 @@ def _is_confirmation_text(text: str) -> bool:
         "да", "давай", "ок", "okay", "хочу", "поехали", "сделай", "делай", "конечно",
     )
     return any(_normalize_for_intent(p) == t or _normalize_for_intent(p) in t for p in confirmations)
+
+
+def _get_clarify_state(profile: Dict[str, Any]) -> Dict[str, Any]:
+    state = profile.get("clarify_state") or {}
+    try:
+        expires_at = float(state.get("expires_at") or 0)
+        if expires_at and time.time() > expires_at:
+            return {"count": 0, "expires_at": 0}
+    except Exception:
+        pass
+    return state or {"count": 0, "expires_at": 0}
+
+
+def _inc_clarify_state(user_id: int, chat_id: int, *, state: Dict[str, Any]) -> None:
+    try:
+        count = int(state.get("count") or 0) + 1
+        patch_user_profile_chat(
+            user_id,
+            chat_id,
+            patch={"clarify_state": {"count": count, "expires_at": time.time() + float(CLARIFY_TTL_SEC)}},
+        )
+    except Exception:
+        _log_exception("clarify_state write failed")
+
+
+def _clear_clarify_state(user_id: int, chat_id: int) -> None:
+    try:
+        patch_user_profile_chat(user_id, chat_id, delete_keys=["clarify_state"])
+    except Exception:
+        _log_exception("clarify_state clear failed")
 
 
 def _extract_invite_topic(text: str) -> Optional[str]:
@@ -2120,6 +2151,7 @@ async def _handle_tarot_routing(
     if _exit_tarot_mode_requested(clean_text or extracted):
         _set_tarot_session_mode(context, enabled=False)
         _clear_pre_dialog_state(user_id, msg.chat_id)
+        _clear_clarify_state(user_id, msg.chat_id)
 
     # recent follow-up invite: start one-shot clarification on confirmation
     invite = _get_recent_followup_invite(user_id)
@@ -2161,6 +2193,7 @@ async def _handle_tarot_routing(
                     clarify_question="",
                     reason="force_after_invite",
                 )
+            _clear_clarify_state(user_id, msg.chat_id)
             _set_tarot_session_mode(context, enabled=True)
             await run_tarot_reading_full(msg, context, user_id, question_text, route)
             return True
@@ -2193,6 +2226,7 @@ async def _handle_tarot_routing(
                 reason="continue_after_clarification",
             )
 
+            _clear_clarify_state(user_id, msg.chat_id)
             _set_tarot_session_mode(context, enabled=True)
             await handle_tarot_flow(update, context, forced_route, combined)
             return True
@@ -2222,21 +2256,30 @@ async def _handle_tarot_routing(
     confidence = float(cls.get("confidence") or 0.0)
     proposed_q = str(cls.get("proposed_question") or "").strip()
     details = cls.get("extracted_details") or {}
+    force_after_clarify = False
 
     if intent_type == "clarification_needed" and proposed_q:
-        await send_smart_answer(msg, proposed_q)
-        # важно: сохраняем диалог, иначе модель "не помнит" что уже спрашивала
-        user_text_for_db = extracted or clean_text or trigger_text
-        _safe_add_user_and_assistant_messages(user_id, msg.chat_id, user_text_for_db, proposed_q)
-        _safe_set_last_context(
-            user_id,
-            topic=topic,
-            last_user_message=user_text_for_db,
-            last_bot_message=proposed_q,
-        )
-        return True
+        profile_chat = get_user_profile_chat(user_id, msg.chat_id) or {}
+        state = _get_clarify_state(profile_chat)
+        count = int(state.get("count") or 0)
+        # максимум два уточняющих вопроса перед раскладом
+        if count >= 2 and (_has_explicit_tarot_trigger(trigger_text) or _has_tarot_consent(trigger_text) or intent_type in ("direct_request", "agreement_to_offer")):
+            force_after_clarify = True
+        else:
+            await send_smart_answer(msg, proposed_q)
+            _inc_clarify_state(user_id, msg.chat_id, state=state)
+            # важно: сохраняем диалог, иначе модель "не помнит" что уже спрашивала
+            user_text_for_db = extracted or clean_text or trigger_text
+            _safe_add_user_and_assistant_messages(user_id, msg.chat_id, user_text_for_db, proposed_q)
+            _safe_set_last_context(
+                user_id,
+                topic=topic,
+                last_user_message=user_text_for_db,
+                last_bot_message=proposed_q,
+            )
+            return True
 
-    if should_do and confidence >= 0.92:
+    if (should_do and confidence >= 0.92) or force_after_clarify:
         # Build enriched question from extracted details
         question_text = trigger_text
         try:
@@ -2278,6 +2321,7 @@ async def _handle_tarot_routing(
                 reason="force_after_classifier",
             )
 
+        _clear_clarify_state(user_id, msg.chat_id)
         _set_tarot_session_mode(context, enabled=True)
         await run_tarot_reading_full(msg, context, user_id, question_text, route)
         return True

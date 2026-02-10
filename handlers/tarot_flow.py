@@ -162,40 +162,40 @@ def _choose_cards_count(question_text: str, spread_name: str) -> int:
     else:
         base = 0
 
-    # Theme-based baselines
+    # Theme-based baselines (держим 1–3 по умолчанию)
     if base == 0 and (any(k in t for k in ("отношен", "любов", "пара", "бывш")) or "отношения" in name):
-        base = 5
+        base = 3
     elif base == 0 and (any(k in t for k in ("деньг", "работ", "карьер", "бизнес", "доход")) or "деньги" in name):
-        base = 5
+        base = 3
     elif base == 0 and any(k in t for k in ("будуще", "перспектив", "дальше", "что будет")):
-        base = 6
+        base = 4
     elif base == 0:
-        # Length-based baseline
+        # Length-based baseline (1–3 чаще, 4–5 реже)
         length = len(t)
-        if length < 35:
+        if length < 50:
             base = 1
-        elif length < 70:
+        elif length < 90:
+            base = 2
+        elif length < 160:
             base = 3
-        elif length < 140:
-            base = 5
         else:
-            base = 6
+            base = 4
 
     # Slightly increase for multi-question/complex requests
     if t.count("?") >= 2 or (" и " in t and len(t) > 80):
         base = min(7, base + 1)
 
-    # Light randomization with bias toward 3 cards
+    # Light randomization with strong bias toward 1–3 cards
     if base <= 2:
-        options = [1, 2, 2, 3]
+        options = [1, 1, 2, 2, 3]
     elif base == 3:
-        options = [2, 3, 3, 3, 4]
+        options = [2, 3, 3, 3]
     elif base == 4:
         options = [3, 4, 4, 5]
     elif base == 5:
-        options = [4, 5, 5, 6]
+        options = [4, 5]
     elif base == 6:
-        options = [5, 6, 6, 7]
+        options = [5, 6]
     else:
         options = [6, 7]
     return random.choice(options)
