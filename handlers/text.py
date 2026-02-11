@@ -547,6 +547,27 @@ def _clear_clarify_state(user_id: int, chat_id: int) -> None:
         _log_exception("clarify_state clear failed")
 
 
+def _count_recent_clarify_questions(history: List[Dict[str, Any]]) -> int:
+    """Count our recent clarifying questions from assistant messages."""
+    if not history:
+        return 0
+    count = 0
+    for m in reversed(history[-10:]):
+        if (m.get("role") or "") != "assistant":
+            continue
+        txt = (m.get("content") or "").lower().strip()
+        if not txt:
+            continue
+        if "хочу помочь максимально точно" in txt:
+            count += 1
+        elif txt.endswith("?") and "расклад" in txt:
+            # fallback: assistant question about clarifying for tarot
+            count += 1
+        if count >= 2:
+            break
+    return count
+
+
 def _extract_invite_topic(text: str) -> Optional[str]:
     t = _normalize_for_intent(text)
     if any(k in t for k in ("любов", "отношен", "чувств", "бывш")):
@@ -2256,20 +2277,27 @@ async def _handle_tarot_routing(
         profile_chat = get_user_profile_chat(user_id, msg.chat_id) or {}
         state = _get_clarify_state(profile_chat)
         count = int(state.get("count") or 0)
+        history_for_count = _safe_get_last_messages(user_id, msg.chat_id, limit=MAX_HISTORY_MESSAGES)
+        recent_q_count = _count_recent_clarify_questions(history_for_count)
+        count = max(count, recent_q_count)
         # максимум два уточняющих вопроса перед раскладом
-        if count >= 2 and (_has_explicit_tarot_trigger(trigger_text) or _has_tarot_consent(trigger_text) or intent_type in ("direct_request", "agreement_to_offer")):
+        if count >= 2:
             force_after_clarify = True
         else:
-            await send_smart_answer(msg, proposed_q)
+            clarify_text = (
+                "Хочу помочь максимально точно и сделать качественный расклад, поэтому уточню один момент.\n\n"
+                f"{proposed_q}"
+            )
+            await send_smart_answer(msg, clarify_text)
             _inc_clarify_state(user_id, msg.chat_id, state=state)
             # важно: сохраняем диалог, иначе модель "не помнит" что уже спрашивала
             user_text_for_db = extracted or clean_text or trigger_text
-            _safe_add_user_and_assistant_messages(user_id, msg.chat_id, user_text_for_db, proposed_q)
+            _safe_add_user_and_assistant_messages(user_id, msg.chat_id, user_text_for_db, clarify_text)
             _safe_set_last_context(
                 user_id,
                 topic=topic,
                 last_user_message=user_text_for_db,
-                last_bot_message=proposed_q,
+                last_bot_message=clarify_text,
             )
             return True
 
