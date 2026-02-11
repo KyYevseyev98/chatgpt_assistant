@@ -59,10 +59,10 @@ REFERRAL_REWARD_SPREADS = 3
 
 # пакеты раскладов
 TAROT_PACKS = [
-    {"key": "5", "spreads": 5, "stars": 100},
-    {"key": "25", "spreads": 25, "stars": 250},
-    {"key": "75", "spreads": 75, "stars": 500},
-    {"key": "200", "spreads": 200, "stars": 1000},
+    {"key": "20", "spreads": 20, "stars": 100},
+    {"key": "60", "spreads": 60, "stars": 250},
+    {"key": "150", "spreads": 150, "stars": 500},
+    {"key": "350", "spreads": 350, "stars": 1000},
 ]
 # Тарифы PRO в звёздах
 PRO_WEEK_STARS = 79      # ~1.9$
